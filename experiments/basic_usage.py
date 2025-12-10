@@ -205,7 +205,7 @@ def main():
                  'r--', label='Perfect prediction')
     axes[1].set_xlabel('True NO₂ (ppb)')
     axes[1].set_ylabel('Predicted NO₂ (ppb)')
-    axes[1].set_title(f'Predictions vs Truth (R²={metrics.to_dict()["r_squared"]:.3f})')
+    axes[1].set_title(f'Predictions vs Truth (R²={metrics.to_dict()["r2"]:.3f})')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
@@ -242,7 +242,7 @@ def main():
     metrics_dict = metrics.to_dict()
     print(f"  • RMSE: {metrics_dict['rmse']:.4f} ppb")
     print(f"  • MAE:  {metrics_dict['mae']:.4f} ppb")
-    print(f"  • R²:   {metrics_dict['r_squared']:.4f}")
+    print(f"  • R²:   {metrics_dict['r2']:.4f}")
     print(f"  • CRPS: {metrics_dict.get('crps', 'N/A')}")
     print("="*70)
 
