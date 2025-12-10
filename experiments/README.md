@@ -8,6 +8,8 @@ This directory contains experimental scripts and benchmarks for the FusionGP fra
 experiments/
 ├── README.md              # This file
 ├── basic_usage.py         # Basic workflow demonstration
+├── reproduce_paper.py     # Paper reproduction experiment
+├── results/               # Experiment results (auto-generated)
 ├── checkpoints/           # Model checkpoints (auto-generated)
 ├── outputs/              # Visualization outputs (auto-generated)
 └── .gitignore            # Ignore generated files
@@ -15,9 +17,36 @@ experiments/
 
 ## Running Experiments
 
-### Basic Usage Example
+### 1. Paper Reproduction
 
-Demonstrates the complete FusionGP workflow:
+Reproduces the main experimental results from the FusionGP paper with the full configuration (800 inducing points, fixed hyperparameters, IDW baseline comparison):
+
+```bash
+cd experiments
+python reproduce_paper.py
+```
+
+This will:
+1. Load and preprocess synthetic NO₂ data
+2. Train FusionSVGP model with 800 inducing points (high capacity)
+3. Compare against IDW baseline
+4. Evaluate on all sources (EPA, low-cost, satellite)
+5. Generate comprehensive visualizations
+
+**Outputs:** (timestamped in `results/experiment_YYYYMMDD_HHMMSS/`)
+- `experiment_summary.txt` - Configuration and metrics
+- `predictions.png` - Mean predictions
+- `uncertainty.png` - Uncertainty estimates
+- `uncertainty_ci.png` - Confidence intervals
+- `predictions_surface.png` - Gridded mean surface
+- `uncertainty_surface.png` - Gridded uncertainty surface
+- `spatial_maps/` - Time-series spatial maps with contours
+
+**Expected runtime:** ~5-10 minutes (300 epochs, CPU)
+
+### 2. Basic Usage Example
+
+Quick demonstration of the FusionGP workflow with reduced model capacity for faster execution:
 
 ```bash
 cd experiments
@@ -27,7 +56,7 @@ python basic_usage.py
 This will:
 1. Load synthetic NO₂ data from multiple sources (EPA, low-cost sensors, satellite)
 2. Preprocess and split data (60% train, 20% val, 20% test)
-3. Initialize and train a FusionSVGP model with 300 inducing points
+3. Initialize and train a FusionSVGP model with 300 inducing points (smaller for speed)
 4. Make predictions on test set
 5. Evaluate performance (RMSE, MAE, R², CRPS)
 6. Generate visualization plots

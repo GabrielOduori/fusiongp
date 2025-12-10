@@ -1,6 +1,7 @@
 # Experiment outputs
 checkpoints/
 outputs/
+results/
 *.pt
 *.pth
 *.pkl
