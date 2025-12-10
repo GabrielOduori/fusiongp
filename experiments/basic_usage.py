@@ -65,12 +65,15 @@ def main():
     preprocessor = DataPreprocessor(
         normalize_targets=True,
         normalize_coords=True,
+        normalize_time=True
+    )
+
+    train_data, val_data, test_data = preprocessor.fit_transform(
+        data,
         train_ratio=0.6,
         val_ratio=0.2,
         test_ratio=0.2
     )
-
-    train_data, val_data, test_data = preprocessor.fit_transform(data)
     scalers = preprocessor.get_scalers()
 
     print(f"   ✓ Train: {len(train_data.coords)} samples")
