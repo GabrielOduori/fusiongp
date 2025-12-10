@@ -40,7 +40,7 @@ from datetime import datetime
 from sklearn.neighbors import NearestNeighbors
 
 # Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent / "fusiongp"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fusiongp.data import DataLoader, DataPreprocessor
 from fusiongp.models import FusionSVGP

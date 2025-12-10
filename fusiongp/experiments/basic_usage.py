@@ -21,7 +21,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 
 # Add parent directory to path to import fusiongp
-sys.path.insert(0, str(Path(__file__).parent.parent / "fusiongp"))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from fusiongp.data import DataLoader, DataPreprocessor
 from fusiongp.models import FusionSVGP

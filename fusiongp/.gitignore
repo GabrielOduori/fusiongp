@@ -1,0 +1,21 @@
+# Results and outputs
+/results
+results/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+
+# Build artifacts
+*.egg-info/
+dist/
+build/
