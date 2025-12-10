@@ -161,9 +161,9 @@ def main():
 
     # Get EPA observations for evaluation (ground truth)
     epa_mask = test_data.source_masks['epa']
-    y_true = test_data.observations['epa'][epa_mask].numpy()
-    y_pred = predictions.mean[epa_mask].numpy()
-    y_std = predictions.std[epa_mask].numpy()
+    y_true = test_data.observations['epa'][epa_mask]
+    y_pred = predictions.mean[epa_mask]
+    y_std = predictions.std[epa_mask]
 
     metrics = evaluator.compute_metrics(
         y_true=y_true,
