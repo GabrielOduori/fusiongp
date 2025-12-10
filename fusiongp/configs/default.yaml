@@ -1,0 +1,290 @@
+# FusionGP Default Configuration
+# ================================
+# This file contains all configurable hyperparameters for the FusionGP framework.
+# 
+# References:
+#   - Hensman et al. (2013): Gaussian processes for big data
+#   - Titsias (2009): Variational learning of inducing variables
+#   - Hamelijnck et al. (2021): Spatio-temporal variational Gaussian processes
+
+# =============================================================================
+# DATA CONFIGURATION
+# =============================================================================
+data:
+  # Column names in the input CSV
+  columns:
+    grid_id: "grid_id"
+    latitude: "latitude"
+    longitude: "longitude"
+    timestamp: "timestamp"
+    satellite: "satellite_values"
+    low_cost: "low_cost_data"
+    epa: "epa_no2"
+  
+  # Spatial configuration
+  spatial:
+    # Grid resolution in meters (for reference)
+    resolution_m: 100
+    # Coordinate reference system
+    crs: "EPSG:4326"
+  
+  # Temporal configuration  
+  temporal:
+    # Temporal resolution
+    resolution: "daily"
+    # Date format in input data
+    date_format: "%Y-%m-%d"
+  
+  # Train/validation/test split ratios
+  split:
+    train: 0.7
+    val: 0.15
+    test: 0.15
+    # Split strategy: "random", "temporal", "spatial"
+    strategy: "random"
+    random_seed: 42
+  
+  # Missing value handling
+  missing:
+    # Strategy: "drop", "interpolate", "mask"
+    strategy: "mask"
+    # Minimum fraction of non-missing values required per grid cell
+    min_coverage: 0.1
+
+# =============================================================================
+# MODEL CONFIGURATION
+# =============================================================================
+model:
+  # Number of inducing points for SVGP
+  # Rule of thumb: 300-1000 for 10k-100k observations
+  n_inducing: 500
+  
+  # Inducing point initialization strategy
+  inducing_init:
+    # Method: "kmeans", "random", "grid"
+    method: "kmeans"
+    # Whether to learn inducing locations during training
+    learn_locations: true
+  
+  # Kernel configuration
+  kernel:
+    # Spatial kernel type: "matern12", "matern32", "matern52", "rbf"
+    spatial_type: "matern32"
+    # Temporal kernel type: "matern12", "matern32", "matern52", "rbf"
+    temporal_type: "matern32"
+    # Whether to use ARD (Automatic Relevance Determination) for spatial dims
+    spatial_ard: true
+    # Initial lengthscales (will be learned)
+    initial_lengthscales:
+      spatial_x: 0.01  # ~1km in normalized coords
+      spatial_y: 0.01
+      temporal: 0.1    # ~3 days in normalized coords
+    # Outputscale initialization
+    initial_outputscale: 1.0
+    # Whether to learn kernel hyperparameters
+    learn_lengthscales: true
+    learn_outputscale: true
+  
+  # Mean function configuration
+  mean:
+    # Type: "constant", "linear", "zero"
+    type: "constant"
+    # Initial value for constant mean
+    initial_value: 0.0
+    # Whether to learn mean parameters
+    learn: true
+  
+  # Likelihood configuration (source-specific noise and calibration)
+  likelihood:
+    # Whether to learn noise variances
+    learn_noise: true
+    # Initial noise standard deviations (log scale internally)
+    initial_noise_std:
+      epa: 1.0        # Low noise for reference monitors
+      low_cost: 5.0   # Higher noise for low-cost sensors
+      satellite: 3.0  # Moderate noise for satellite
+    # Noise bounds (standard deviation)
+    noise_bounds:
+      min: 0.1
+      max: 50.0
+    
+    # Low-cost sensor calibration parameters
+    calibration:
+      # Whether to learn calibration parameters
+      learn: true
+      # Initial slope (a in y = a*f + b)
+      initial_slope: 1.0
+      # Initial intercept (b in y = a*f + b)
+      initial_intercept: 0.0
+      # Bounds for slope
+      slope_bounds:
+        min: 0.1
+        max: 3.0
+      # Bounds for intercept
+      intercept_bounds:
+        min: -20.0
+        max: 20.0
+
+# =============================================================================
+# TRAINING CONFIGURATION
+# =============================================================================
+training:
+  # Number of training epochs
+  n_epochs: 500
+  
+  # Batch size for stochastic optimization
+  # Larger = more stable gradients, smaller = faster iteration
+  batch_size: 1024
+  
+  # Optimizer configuration
+  optimizer:
+    # Type: "adam", "adamw", "sgd"
+    type: "adam"
+    # Learning rate
+    lr: 0.01
+    # Weight decay (L2 regularization)
+    weight_decay: 0.0
+    # Adam-specific parameters
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  
+  # Learning rate scheduler
+  scheduler:
+    # Type: "reduce_on_plateau", "cosine", "step", "none"
+    type: "reduce_on_plateau"
+    # Patience (epochs without improvement before reducing LR)
+    patience: 20
+    # Factor to reduce LR by
+    factor: 0.5
+    # Minimum learning rate
+    min_lr: 1.0e-6
+    # Metric to monitor: "loss", "val_loss", "val_rmse"
+    monitor: "val_loss"
+  
+  # Early stopping
+  early_stopping:
+    enabled: true
+    # Patience (epochs without improvement before stopping)
+    patience: 50
+    # Minimum improvement to count as progress
+    min_delta: 1.0e-4
+    # Metric to monitor
+    monitor: "val_loss"
+    # Mode: "min" or "max"
+    mode: "min"
+  
+  # Checkpointing
+  checkpoint:
+    enabled: true
+    # Save best model only, or all checkpoints
+    save_best_only: true
+    # Directory to save checkpoints
+    save_dir: "checkpoints"
+    # Metric to monitor for best model
+    monitor: "val_loss"
+  
+  # Logging
+  logging:
+    # Log every N batches
+    log_interval: 10
+    # Validation every N epochs
+    val_interval: 5
+    # Whether to use progress bar
+    progress_bar: true
+  
+  # Gradient clipping (helps with training stability)
+  gradient_clip:
+    enabled: true
+    max_norm: 1.0
+  
+  # Random seed for reproducibility
+  seed: 42
+
+# =============================================================================
+# INFERENCE CONFIGURATION
+# =============================================================================
+inference:
+  # Batch size for predictions (can be larger than training)
+  batch_size: 2048
+  
+  # Number of samples for uncertainty estimation
+  # More samples = more accurate uncertainty, but slower
+  n_samples: 100
+  
+  # Prediction grid configuration
+  grid:
+    # Resolution for prediction grid (in same units as input)
+    # If null, use same grid as input data
+    resolution: null
+  
+  # Confidence levels for prediction intervals
+  confidence_levels: [0.5, 0.9, 0.95]
+
+# =============================================================================
+# EVALUATION CONFIGURATION
+# =============================================================================
+evaluation:
+  # Metrics to compute
+  metrics:
+    # Point prediction metrics
+    point:
+      - "rmse"
+      - "mae"
+      - "r2"
+      - "bias"
+      - "mape"  # Mean Absolute Percentage Error
+    
+    # Probabilistic/Gaussian metrics
+    probabilistic:
+      - "nll"           # Negative Log-Likelihood
+      - "crps"          # Continuous Ranked Probability Score
+      - "dss"           # Dawid-Sebastiani Score
+      - "energy_score"  # Energy Score
+      - "calibration"   # Calibration at various levels
+      - "sharpness"     # Average predictive std
+      - "pit"           # Probability Integral Transform
+    
+    # Coverage levels for calibration
+    coverage_levels: [0.5, 0.8, 0.9, 0.95]
+  
+  # Cross-validation configuration
+  cross_validation:
+    enabled: false
+    # Number of folds
+    n_folds: 5
+    # CV strategy: "random", "spatial", "temporal"
+    strategy: "random"
+  
+  # Per-source evaluation
+  per_source: true
+
+# =============================================================================
+# VISUALIZATION CONFIGURATION
+# =============================================================================
+visualization:
+  # Figure settings
+  figure:
+    dpi: 150
+    figsize: [12, 8]
+    style: "seaborn-v0_8-whitegrid"
+  
+  # Colormap settings
+  colormap:
+    predictions: "RdYlBu_r"    # Red-Yellow-Blue reversed (high=red)
+    uncertainty: "YlOrRd"      # Yellow-Orange-Red
+    residuals: "RdBu_r"        # Red-Blue for residuals
+  
+  # Map settings
+  maps:
+    # Whether to add basemap (requires contextily)
+    add_basemap: false
+    # Whether to show grid lines
+    show_grid: true
+    # Marker size for observations
+    marker_size: 20
+  
+  # Save settings
+  save:
+    format: "png"
+    dpi: 300
+    bbox_inches: "tight"

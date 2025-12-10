@@ -1,0 +1,280 @@
+Metadata-Version: 2.4
+Name: fusiongp
+Version: 0.1.0
+Summary: Scalable Probabilistic Multi-Source NO₂ Fusion using Sparse Variational Gaussian Processes
+Author-email: Your Name <your.email@example.com>
+License: MIT
+Project-URL: Homepage, https://github.com/yourusername/fusiongp
+Project-URL: Documentation, https://github.com/yourusername/fusiongp#readme
+Project-URL: Repository, https://github.com/yourusername/fusiongp
+Project-URL: Issues, https://github.com/yourusername/fusiongp/issues
+Keywords: gaussian-processes,air-quality,sensor-fusion,spatio-temporal,variational-inference,machine-learning,environmental-monitoring
+Classifier: Development Status :: 3 - Alpha
+Classifier: Intended Audience :: Science/Research
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Programming Language :: Python :: 3
+Classifier: Programming Language :: Python :: 3.9
+Classifier: Programming Language :: Python :: 3.10
+Classifier: Programming Language :: Python :: 3.11
+Classifier: Topic :: Scientific/Engineering :: Artificial Intelligence
+Classifier: Topic :: Scientific/Engineering :: Atmospheric Science
+Requires-Python: >=3.9
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.0.0
+Requires-Dist: gpytorch>=1.11
+Requires-Dist: pandas>=2.0.0
+Requires-Dist: numpy>=1.24.0
+Requires-Dist: scipy>=1.10.0
+Requires-Dist: scikit-learn>=1.3.0
+Requires-Dist: matplotlib>=3.7.0
+Requires-Dist: seaborn>=0.12.0
+Requires-Dist: tqdm>=4.65.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: properscoring>=0.1
+Provides-Extra: dev
+Requires-Dist: pytest>=7.0.0; extra == "dev"
+Requires-Dist: pytest-cov>=4.0.0; extra == "dev"
+Requires-Dist: black>=23.0.0; extra == "dev"
+Requires-Dist: isort>=5.12.0; extra == "dev"
+Requires-Dist: flake8>=6.0.0; extra == "dev"
+Requires-Dist: mypy>=1.0.0; extra == "dev"
+Provides-Extra: notebooks
+Requires-Dist: jupyter>=1.0.0; extra == "notebooks"
+Requires-Dist: ipywidgets>=8.0.0; extra == "notebooks"
+Provides-Extra: all
+Requires-Dist: fusiongp[dev,notebooks]; extra == "all"
+
+# FusionGP: Scalable Probabilistic Multi-Source NO₂ Fusion
+
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![GPyTorch](https://img.shields.io/badge/GPyTorch-1.11+-green.svg)](https://gpytorch.ai/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
+## Overview
+
+**FusionGP** is a scalable probabilistic framework for fusing heterogeneous NO₂ observations into a unified spatio-temporal field using Sparse Variational Gaussian Processes (SVGPs). The framework integrates:
+
+- **EPA Regulatory Monitors**: High-accuracy reference measurements (sparse spatial coverage)
+- **Low-Cost Sensors**: Dense spatial coverage with potential bias and drift
+- **Satellite Retrievals**: Broad spatial coverage with coarser resolution
+
+### Key Features
+
+- **Single Latent Field**: One GP models the true NO₂ concentration; all sources observe it through source-specific likelihoods
+- **Automatic Bias Correction**: Learns linear calibration (slope `a`, intercept `b`) for low-cost sensors
+- **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_LC, σ²_SAT)
+- **Scalable Inference**: SVGP with inducing points enables O(NM²) complexity instead of O(N³)
+- **Uncertainty Quantification**: Full predictive distributions with calibrated uncertainty
+
+## Mathematical Formulation
+
+### Generative Model
+
+Let `f(s,t)` denote the true latent NO₂ concentration at location `s=(x,y)` and time `t`.
+
+Each source `q ∈ {EPA, LC, SAT}` produces observations:
+
+```
+y_i^(q) = h_q(f(s_i, t_i)) + ε_i^(q),  ε_i^(q) ~ N(0, σ_q²)
+```
+
+Where the link functions are:
+- **EPA**: `h_EPA(f) = f` (unbiased reference)
+- **Low-Cost**: `h_LC(f) = a·f + b` (linear calibration)
+- **Satellite**: `h_SAT(f) = f` (unbiased but higher noise)
+
+### GP Prior
+
+```
+f(s,t) ~ GP(m(s,t), k_space(s,s') · k_time(t,t'))
+```
+
+- `k_space`: Matérn-3/2 kernel with ARD over (x, y)
+- `k_time`: Matérn-3/2 kernel over time
+- `m(·)`: Constant mean function
+
+### SVGP Inference
+
+We maximize the Evidence Lower Bound (ELBO):
+
+```
+L = E_q(f)[log p(y|f)] - KL(q(u) || p(u))
+```
+
+Where:
+- `Z ∈ R^(M×3)`: Inducing points in (x, y, t) space
+- `u = f(Z)`: Inducing values
+- `q(u) = N(m, S)`: Variational posterior
+
+## Installation
+
+```bash
+# Clone the repository
+git clone https://github.com/yourusername/fusiongp.git
+cd fusiongp
+
+# Install dependencies
+pip install -e .
+
+# Or install dependencies directly
+pip install torch gpytorch pandas numpy scipy scikit-learn matplotlib seaborn tqdm pyyaml
+```
+
+## Quick Start
+
+```python
+from fusiongp.data import DataLoader, DataPreprocessor
+from fusiongp.models import FusionSVGP
+from fusiongp.training import Trainer
+from fusiongp.inference import Predictor
+from fusiongp.evaluation import Evaluator
+from fusiongp.visualization import plot_predictions, plot_uncertainty
+
+# 1. Load and preprocess data
+loader = DataLoader("path/to/data.csv")
+data = loader.load()
+
+preprocessor = DataPreprocessor()
+train_data, test_data, scalers = preprocessor.fit_transform(data)
+
+# 2. Initialize model
+model = FusionSVGP(
+    n_inducing=500,
+    kernel_type="matern32",
+    learn_inducing_locations=True
+)
+
+# 3. Train
+trainer = Trainer(model, learning_rate=0.01, n_epochs=500)
+trainer.fit(train_data)
+
+# 4. Predict
+predictor = Predictor(model, scalers)
+predictions = predictor.predict_grid(test_data)
+
+# 5. Evaluate
+evaluator = Evaluator()
+metrics = evaluator.compute_all_metrics(predictions, test_data)
+print(metrics)
+
+# 6. Visualize
+plot_predictions(predictions, save_path="results/predictions.png")
+plot_uncertainty(predictions, save_path="results/uncertainty.png")
+```
+
+## Project Structure
+
+```
+fusiongp/
+├── README.md                    # This file
+├── pyproject.toml              # Project configuration and dependencies
+├── fusiongp/
+│   ├── __init__.py             # Package initialization
+│   ├── data/
+│   │   ├── __init__.py
+│   │   ├── loader.py           # Data loading and validation
+│   │   └── preprocessor.py     # Normalization, splitting, batching
+│   ├── models/
+│   │   ├── __init__.py
+│   │   ├── kernels.py          # Spatio-temporal kernel definitions
+│   │   ├── svgp.py             # Core SVGP model implementation
+│   │   └── likelihoods.py      # Multi-source heteroscedastic likelihood
+│   ├── training/
+│   │   ├── __init__.py
+│   │   ├── trainer.py          # Training loop with logging
+│   │   └── callbacks.py        # Early stopping, checkpointing, scheduling
+│   ├── inference/
+│   │   ├── __init__.py
+│   │   └── predictor.py        # Gridded predictions with uncertainty
+│   ├── evaluation/
+│   │   ├── __init__.py
+│   │   ├── metrics.py          # Comprehensive evaluation metrics
+│   │   └── cross_validation.py # Spatial and temporal cross-validation
+│   └── visualization/
+│       ├── __init__.py
+│       ├── maps.py             # Spatial prediction maps
+│       ├── uncertainty.py      # Uncertainty visualization
+│       └── diagnostics.py      # Training curves, residuals, calibration
+├── notebooks/
+│   └── demo.ipynb              # End-to-end demonstration
+├── tests/
+│   ├── __init__.py
+│   ├── test_data.py
+│   ├── test_models.py
+│   └── test_metrics.py
+└── configs/
+    └── default.yaml            # Default hyperparameters
+```
+
+## Evaluation Metrics
+
+FusionGP computes comprehensive metrics for probabilistic model evaluation:
+
+### Point Prediction Metrics
+- **RMSE**: Root Mean Squared Error
+- **MAE**: Mean Absolute Error
+- **R²**: Coefficient of Determination
+- **Bias**: Mean prediction error
+
+### Probabilistic/Gaussian Metrics
+- **NLL**: Negative Log-Likelihood
+- **CRPS**: Continuous Ranked Probability Score
+- **Calibration**: Coverage at various confidence levels
+- **Sharpness**: Average predictive standard deviation
+- **DSS**: Dawid-Sebastiani Score
+- **Energy Score**: Multivariate probabilistic metric
+
+### Per-Source Metrics
+All metrics computed separately for EPA, Low-Cost, and Satellite observations.
+
+## Configuration
+
+See `configs/default.yaml` for all configurable parameters:
+
+```yaml
+model:
+  n_inducing: 500
+  kernel:
+    spatial: matern32
+    temporal: matern32
+    learn_lengthscales: true
+  likelihood:
+    learn_noise: true
+    learn_calibration: true
+
+training:
+  n_epochs: 500
+  batch_size: 1024
+  learning_rate: 0.01
+  optimizer: adam
+  scheduler:
+    type: reduce_on_plateau
+    patience: 20
+    factor: 0.5
+
+inference:
+  n_samples: 100
+  batch_size: 2048
+```
+
+## References
+
+1. Hensman, J., Fusi, N., & Lawrence, N. D. (2013). Gaussian processes for big data. UAI.
+2. Titsias, M. (2009). Variational learning of inducing variables in sparse Gaussian processes. AISTATS.
+3. Hamelijnck, O., et al. (2021). Spatio-temporal variational Gaussian processes. NeurIPS.
+4. Williams, C. K., & Rasmussen, C. E. (2006). Gaussian processes for machine learning. MIT Press.
+
+## License
+
+MIT License - see LICENSE file for details.
+
+## Citation
+
+```bibtex
+@software{fusiongp2024,
+  title={FusionGP: Scalable Probabilistic Multi-Source NO₂ Fusion},
+  author={Your Name},
+  year={2024},
+  url={https://github.com/yourusername/fusiongp}
+}
+```
