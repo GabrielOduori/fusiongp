@@ -1,0 +1,35 @@
+# Experiment outputs
+checkpoints/
+outputs/
+*.pt
+*.pth
+*.pkl
+*.pickle
+
+# Plots and visualizations
+*.png
+*.jpg
+*.pdf
+*.svg
+
+# Logs
+*.log
+logs/
+
+# Data (if experiments generate data)
+*.csv
+*.npy
+*.npz
+
+# MLflow/Tensorboard tracking
+mlruns/
+runs/
+.tensorboard/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
