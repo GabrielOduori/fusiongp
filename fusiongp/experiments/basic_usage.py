@@ -203,8 +203,8 @@ def main():
     axes[1].plot([y_true.min(), y_true.max()],
                  [y_true.min(), y_true.max()],
                  'r--', label='Perfect prediction')
-    axes[1].set_xlabel('True NO₂ (ppb)')
-    axes[1].set_ylabel('Predicted NO₂ (ppb)')
+    axes[1].set_xlabel('True NO₂ (µg/m³)')
+    axes[1].set_ylabel('Predicted NO₂ (µg/m³)')
     axes[1].set_title(f'Predictions vs Truth (R²={metrics.to_dict()["r2"]:.3f})')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
@@ -220,8 +220,8 @@ def main():
     ax.scatter(y_std, errors, alpha=0.5, s=20)
     ax.plot([0, y_std.max()], [0, y_std.max()], 'r--',
             label='Perfect calibration')
-    ax.set_xlabel('Predicted Std (ppb)')
-    ax.set_ylabel('Absolute Error (ppb)')
+    ax.set_xlabel('Predicted Std (µg/m³)')
+    ax.set_ylabel('Absolute Error (µg/m³)')
     ax.set_title('Uncertainty Calibration')
     ax.legend()
     ax.grid(True, alpha=0.3)
@@ -240,8 +240,8 @@ def main():
     print(f"Outputs: {output_dir}")
     print("\nKey Results:")
     metrics_dict = metrics.to_dict()
-    print(f"  • RMSE: {metrics_dict['rmse']:.4f} ppb")
-    print(f"  • MAE:  {metrics_dict['mae']:.4f} ppb")
+    print(f"  • RMSE: {metrics_dict['rmse']:.4f} µg/m³")
+    print(f"  • MAE:  {metrics_dict['mae']:.4f} µg/m³")
     print(f"  • R²:   {metrics_dict['r2']:.4f}")
     print(f"  • CRPS: {metrics_dict.get('crps', 'N/A')}")
     print("="*70)

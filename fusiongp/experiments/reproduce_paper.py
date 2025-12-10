@@ -418,7 +418,7 @@ def main():
             y_true=y_epa,
             confidence_levels=[0.5, 0.8, 0.9, 0.95],
             xlabel="EPA test index",
-            ylabel="NO₂ (ppb)",
+            ylabel="NO₂ (µg/m³)",
             title="EPA Predictions with Confidence Intervals",
             save_path=str(experiment_dir / "uncertainty_ci.png"),
         )
@@ -453,7 +453,7 @@ def main():
     # Mean surface
     fig, ax = plt.subplots(figsize=(8, 6))
     pcm = ax.pcolormesh(lon_unique, lat_unique, mean_grid, shading="auto", cmap="RdYlBu_r")
-    fig.colorbar(pcm, ax=ax, label="Mean NO₂ (ppb)")
+    fig.colorbar(pcm, ax=ax, label="Mean NO₂ (µg/m³)")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"Gridded Mean Predictions (t={ts0:.2f})")
@@ -464,7 +464,7 @@ def main():
     # Uncertainty surface
     fig, ax = plt.subplots(figsize=(8, 6))
     pcm = ax.pcolormesh(lon_unique, lat_unique, std_grid, shading="auto", cmap="YlOrRd")
-    fig.colorbar(pcm, ax=ax, label="Std Dev (ppb)")
+    fig.colorbar(pcm, ax=ax, label="Std Dev (µg/m³)")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"Gridded Uncertainty (t={ts0:.2f})")
@@ -480,10 +480,10 @@ def main():
     print("="*70)
     print(f"Results directory: {experiment_dir}")
     print("\nKey Performance Metrics:")
-    print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} ppb")
-    print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} ppb")
+    print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} µg/m³")
+    print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} µg/m³")
     print(f"  • R²:   {epa_metrics.to_dict()['r2']:.4f}")
-    print(f"  • Bias: {epa_metrics.to_dict()['bias']:.4f} ppb")
+    print(f"  • Bias: {epa_metrics.to_dict()['bias']:.4f} µg/m³")
     print("="*70)
 
 
