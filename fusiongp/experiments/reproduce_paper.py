@@ -280,7 +280,7 @@ def main():
           f"{predictions.mean.max():.4f}, {predictions.mean.mean():.4f}")
     print(f"   pred std range/mean (orig scale): {predictions.std.min():.4f}, "
           f"{predictions.std.max():.4f}, {predictions.std.mean():.4f}")
-    print(f"   mask counts: {k: v.sum() for k, v in test_data.source_masks.items()}")
+    print(f"   mask counts: {dict((k, v.sum()) for k, v in test_data.source_masks.items())}")
 
     # Grid predictions for spatial maps
     lat_min, lat_max = data.coords[:, 0].min(), data.coords[:, 0].max()
