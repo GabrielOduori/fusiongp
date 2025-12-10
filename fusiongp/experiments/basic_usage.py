@@ -20,14 +20,14 @@ import numpy as np
 import matplotlib.pyplot as plt
 from pathlib import Path
 
-# Add parent directory to path to import fusiongp
+# Add parent directory to path to import src
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fusiongp.data import DataLoader, DataPreprocessor
-from fusiongp.models import FusionSVGP
-from fusiongp.training import Trainer, EarlyStopping, ModelCheckpoint
-from fusiongp.inference import Predictor
-from fusiongp.evaluation import Evaluator
+from src.data import DataLoader, DataPreprocessor
+from src.models import FusionSVGP
+from src.training import Trainer, EarlyStopping, ModelCheckpoint
+from src.inference import Predictor
+from src.evaluation import Evaluator
 
 
 def main():
@@ -40,7 +40,7 @@ def main():
     # -------------------------------------------------------------------------
     print("\n[1/7] Loading synthetic NO₂ data...")
 
-    data_path = Path(__file__).parent.parent / "fusiongp/notebooks/synthetic_no2_data.csv"
+    data_path = Path(__file__).parent.parent / "notebooks/synthetic_no2_data.csv"
 
     if not data_path.exists():
         raise FileNotFoundError(

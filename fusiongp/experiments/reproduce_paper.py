@@ -42,13 +42,13 @@ from sklearn.neighbors import NearestNeighbors
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from fusiongp.data import DataLoader, DataPreprocessor
-from fusiongp.models import FusionSVGP
-from fusiongp.training import Trainer
-from fusiongp.inference import Predictor
-from fusiongp.evaluation import Evaluator, rmse, mae, r_squared, bias
-from fusiongp.visualization import plot_predictions, plot_uncertainty, plot_confidence_intervals
-from fusiongp.visualization.spatial_maps import create_spatial_maps
+from src.data import DataLoader, DataPreprocessor
+from src.models import FusionSVGP
+from src.training import Trainer
+from src.inference import Predictor
+from src.evaluation import Evaluator, rmse, mae, r_squared, bias
+from src.visualization import plot_predictions, plot_uncertainty, plot_confidence_intervals
+from src.visualization.spatial_maps import create_spatial_maps
 
 
 # =============================================================================
@@ -56,7 +56,7 @@ from fusiongp.visualization.spatial_maps import create_spatial_maps
 # =============================================================================
 
 # Data path (modify if needed)
-DATA_PATH = Path(__file__).parent.parent / "fusiongp/notebooks/synthetic_no2_data.csv"
+DATA_PATH = Path(__file__).parent.parent / "notebooks/synthetic_no2_data.csv"
 
 # Model hyperparameters (paper configuration)
 MODEL_CONFIG = {

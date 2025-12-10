@@ -72,7 +72,7 @@ Issues = "https://github.com/yourusername/fusiongp/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["fusiongp*"]
+include = ["src*"]
 
 [tool.black]
 line-length = 100
@@ -96,7 +96,7 @@ exclude = '''
 [tool.isort]
 profile = "black"
 line_length = 100
-known_first_party = ["fusiongp"]
+known_first_party = ["src"]
 
 [tool.mypy]
 python_version = "3.9"
@@ -108,4 +108,4 @@ ignore_missing_imports = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 python_functions = ["test_*"]
-addopts = "-v --cov=fusiongp --cov-report=term-missing"
+addopts = "-v --cov=src --cov-report=term-missing"

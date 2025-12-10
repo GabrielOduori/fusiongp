@@ -10,8 +10,8 @@ import pytest
 import tempfile
 from pathlib import Path
 
-from fusiongp.data.loader import DataLoader, FusionData, FusionDataset
-from fusiongp.data.preprocessor import DataPreprocessor, Scalers
+from src.data.loader import DataLoader, FusionData, FusionDataset
+from src.data.preprocessor import DataPreprocessor, Scalers
 
 
 @pytest.fixture

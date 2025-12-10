@@ -7,7 +7,7 @@ Run with: pytest tests/test_metrics.py -v
 import numpy as np
 import pytest
 
-from fusiongp.evaluation.metrics import (
+from src.evaluation.metrics import (
     rmse, mae, r_squared, bias, mape,
     negative_log_likelihood, crps, dawid_sebastiani_score,
     calibration_error, coverage, sharpness,
