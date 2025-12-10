@@ -482,7 +482,7 @@ def main():
     print("\nKey Performance Metrics:")
     print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} ppb")
     print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} ppb")
-    print(f"  • R²:   {epa_metrics.to_dict()['r_squared']:.4f}")
+    print(f"  • R²:   {epa_metrics.to_dict()['r2']:.4f}")
     print(f"  • Bias: {epa_metrics.to_dict()['bias']:.4f} ppb")
     print("="*70)
 
