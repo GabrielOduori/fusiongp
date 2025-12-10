@@ -165,17 +165,18 @@ def main():
     y_pred = predictions.mean[epa_mask]
     y_std = predictions.std[epa_mask]
 
-    metrics = evaluator.compute_metrics(
+    metrics = evaluator.evaluate(
         y_true=y_true,
-        y_pred=y_pred,
-        y_std=y_std
+        y_pred_mean=y_pred,
+        y_pred_std=y_std
     )
 
     print("\n   Metrics (on EPA test observations):")
     print(f"   {'Metric':<20} {'Value':>10}")
     print("   " + "-"*32)
-    for metric_name, metric_value in metrics.items():
-        print(f"   {metric_name:<20} {metric_value:>10.4f}")
+    for metric_name, metric_value in metrics.to_dict().items():
+        if isinstance(metric_value, (int, float, np.number)):
+            print(f"   {metric_name:<20} {metric_value:>10.4f}")
 
     # -------------------------------------------------------------------------
     # 7. Visualize Results
@@ -204,7 +205,7 @@ def main():
                  'r--', label='Perfect prediction')
     axes[1].set_xlabel('True NO₂ (ppb)')
     axes[1].set_ylabel('Predicted NO₂ (ppb)')
-    axes[1].set_title(f'Predictions vs Truth (R²={metrics["r_squared"]:.3f})')
+    axes[1].set_title(f'Predictions vs Truth (R²={metrics.to_dict()["r_squared"]:.3f})')
     axes[1].legend()
     axes[1].grid(True, alpha=0.3)
 
@@ -238,10 +239,11 @@ def main():
     print(f"Model checkpoint: experiments/checkpoints/best_model.pt")
     print(f"Outputs: {output_dir}")
     print("\nKey Results:")
-    print(f"  • RMSE: {metrics['rmse']:.4f} ppb")
-    print(f"  • MAE:  {metrics['mae']:.4f} ppb")
-    print(f"  • R²:   {metrics['r_squared']:.4f}")
-    print(f"  • CRPS: {metrics.get('crps', 'N/A')}")
+    metrics_dict = metrics.to_dict()
+    print(f"  • RMSE: {metrics_dict['rmse']:.4f} ppb")
+    print(f"  • MAE:  {metrics_dict['mae']:.4f} ppb")
+    print(f"  • R²:   {metrics_dict['r_squared']:.4f}")
+    print(f"  • CRPS: {metrics_dict.get('crps', 'N/A')}")
     print("="*70)
 
 
