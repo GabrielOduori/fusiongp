@@ -6,7 +6,7 @@ including spatial uncertainty maps and confidence interval plots.
 
 Example
 -------
->>> from fusiongp.visualization import plot_uncertainty
+>>> from src.visualization import plot_uncertainty
 >>> fig = plot_uncertainty(predictions)
 >>> fig.savefig("uncertainty.png")
 """

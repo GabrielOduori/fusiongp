@@ -6,7 +6,7 @@ and observations, including support for multiple time slices.
 
 Example
 -------
->>> from fusiongp.visualization import plot_predictions
+>>> from src.visualization import plot_predictions
 >>> fig = plot_predictions(predictions, title="NO₂ Predictions")
 >>> fig.savefig("predictions.png")
 """

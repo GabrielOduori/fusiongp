@@ -51,8 +51,8 @@ from gpytorch.means import ConstantMean
 from gpytorch.distributions import MultivariateNormal
 from sklearn.cluster import KMeans
 
-from fusiongp.models.kernels import SpatioTemporalKernel
-from fusiongp.models.likelihoods import MultiSourceLikelihood
+from src.models.kernels import SpatioTemporalKernel
+from src.models.likelihoods import MultiSourceLikelihood
 
 logger = logging.getLogger(__name__)
 

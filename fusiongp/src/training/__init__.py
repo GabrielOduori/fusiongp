@@ -17,8 +17,8 @@ ModelCheckpoint
     Callback to save model checkpoints.
 """
 
-from fusiongp.training.trainer import Trainer
-from fusiongp.training.callbacks import EarlyStopping, ModelCheckpoint, LRScheduler
+from src.training.trainer import Trainer
+from src.training.callbacks import EarlyStopping, ModelCheckpoint, LRScheduler
 
 __all__ = [
     "Trainer",

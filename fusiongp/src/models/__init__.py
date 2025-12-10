@@ -23,9 +23,9 @@ References
        in sparse Gaussian processes. AISTATS.
 """
 
-from fusiongp.models.kernels import SpatioTemporalKernel
-from fusiongp.models.likelihoods import MultiSourceLikelihood
-from fusiongp.models.svgp import FusionSVGP
+from src.models.kernels import SpatioTemporalKernel
+from src.models.likelihoods import MultiSourceLikelihood
+from src.models.svgp import FusionSVGP
 
 __all__ = [
     "FusionSVGP",

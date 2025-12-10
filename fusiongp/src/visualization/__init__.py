@@ -22,9 +22,9 @@ plot_residuals
     Analyze prediction residuals.
 """
 
-from fusiongp.visualization.maps import plot_predictions, plot_spatial_field
-from fusiongp.visualization.uncertainty import plot_uncertainty, plot_confidence_intervals
-from fusiongp.visualization.diagnostics import (
+from src.visualization.maps import plot_predictions, plot_spatial_field
+from src.visualization.uncertainty import plot_uncertainty, plot_confidence_intervals
+from src.visualization.diagnostics import (
     plot_training_history,
     plot_calibration,
     plot_residuals,

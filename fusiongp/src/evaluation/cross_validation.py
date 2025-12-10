@@ -34,7 +34,7 @@ import numpy as np
 from sklearn.cluster import KMeans
 from sklearn.model_selection import KFold
 
-from fusiongp.data.loader import FusionData
+from src.data.loader import FusionData
 
 logger = logging.getLogger(__name__)
 

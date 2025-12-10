@@ -9,6 +9,6 @@ Predictor
     Make gridded predictions with uncertainty estimates.
 """
 
-from fusiongp.inference.predictor import Predictor
+from src.inference.predictor import Predictor
 
 __all__ = ["Predictor"]

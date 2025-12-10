@@ -17,7 +17,7 @@ compute_metrics
     Compute all metrics for predictions.
 """
 
-from fusiongp.evaluation.metrics import (
+from src.evaluation.metrics import (
     Evaluator,
     compute_metrics,
     rmse,

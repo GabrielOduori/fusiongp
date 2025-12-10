@@ -49,12 +49,12 @@ __author__ = "Your Name"
 __email__ = "your.email@example.com"
 
 # Public API imports
-from fusiongp.data import DataLoader, DataPreprocessor
-from fusiongp.models import FusionSVGP, SpatioTemporalKernel, MultiSourceLikelihood
-from fusiongp.training import Trainer, EarlyStopping, ModelCheckpoint
-from fusiongp.inference import Predictor
-from fusiongp.evaluation import Evaluator, compute_metrics
-from fusiongp.visualization import (
+from src.data import DataLoader, DataPreprocessor
+from src.models import FusionSVGP, SpatioTemporalKernel, MultiSourceLikelihood
+from src.training import Trainer, EarlyStopping, ModelCheckpoint
+from src.inference import Predictor
+from src.evaluation import Evaluator, compute_metrics
+from src.visualization import (
     plot_predictions,
     plot_uncertainty,
     plot_training_history,

@@ -6,7 +6,7 @@ training curves, calibration plots, residual analysis, and PIT histograms.
 
 Example
 -------
->>> from fusiongp.visualization import plot_training_history, plot_calibration
+>>> from src.visualization import plot_training_history, plot_calibration
 >>> plot_training_history(history)
 >>> plot_calibration(y_true, predictions)
 """

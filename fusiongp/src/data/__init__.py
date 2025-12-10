@@ -17,8 +17,8 @@ FusionDataset
     PyTorch Dataset for mini-batch training.
 """
 
-from fusiongp.data.loader import DataLoader, FusionDataset
-from fusiongp.data.preprocessor import DataPreprocessor
+from src.data.loader import DataLoader, FusionDataset
+from src.data.preprocessor import DataPreprocessor
 
 __all__ = [
     "DataLoader",

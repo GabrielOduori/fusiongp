@@ -40,9 +40,9 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from fusiongp.data.loader import FusionData, FusionDataset
-from fusiongp.models.svgp import FusionSVGP
-from fusiongp.training.callbacks import Callback, EarlyStopping, ModelCheckpoint, LRScheduler
+from src.data.loader import FusionData, FusionDataset
+from src.models.svgp import FusionSVGP
+from src.training.callbacks import Callback, EarlyStopping, ModelCheckpoint, LRScheduler
 
 logger = logging.getLogger(__name__)
 

@@ -36,7 +36,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from sklearn.model_selection import train_test_split
 
-from fusiongp.data.loader import FusionData
+from src.data.loader import FusionData
 
 logger = logging.getLogger(__name__)
 

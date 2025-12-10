@@ -33,9 +33,9 @@ import numpy as np
 import torch
 from tqdm import tqdm
 
-from fusiongp.data.loader import FusionData
-from fusiongp.data.preprocessor import Scalers
-from fusiongp.models.svgp import FusionSVGP
+from src.data.loader import FusionData
+from src.data.preprocessor import Scalers
+from src.models.svgp import FusionSVGP
 
 logger = logging.getLogger(__name__)
 
