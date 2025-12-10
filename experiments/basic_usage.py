@@ -25,7 +25,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "fusiongp"))
 
 from fusiongp.data import DataLoader, DataPreprocessor
 from fusiongp.models import FusionSVGP
-from fusiongp.training import Trainer
+from fusiongp.training import Trainer, EarlyStopping, ModelCheckpoint
 from fusiongp.inference import Predictor
 from fusiongp.evaluation import Evaluator
 
@@ -113,13 +113,18 @@ def main():
     # -------------------------------------------------------------------------
     print("\n[4/7] Training model...")
 
+    # Setup callbacks
+    callbacks = [
+        EarlyStopping(patience=20, monitor='val_loss', mode='min'),
+        ModelCheckpoint(save_dir="experiments/checkpoints", monitor='val_loss', mode='min')
+    ]
+
     trainer = Trainer(
         model,
         learning_rate=0.01,
         n_epochs=100,  # Reduced for faster demo
         batch_size=512,
-        patience=20,
-        checkpoint_dir="experiments/checkpoints"
+        callbacks=callbacks
     )
 
     print(f"   ✓ Training config: lr={trainer.learning_rate}, "
@@ -127,8 +132,8 @@ def main():
 
     history = trainer.fit(train_data, val_data=val_data, verbose=True)
 
-    print(f"   ✓ Training completed in {trainer.elapsed_epochs} epochs")
-    print(f"   ✓ Best validation loss: {min(history['val_loss']):.4f}")
+    print(f"   ✓ Training completed in {len(history.train_loss)} epochs")
+    print(f"   ✓ Best validation loss: {history.best_val_loss:.4f}")
 
     # -------------------------------------------------------------------------
     # 5. Make Predictions
@@ -184,8 +189,8 @@ def main():
     # Plot 1: Training history
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-    axes[0].plot(history['train_loss'], label='Train Loss', alpha=0.7)
-    axes[0].plot(history['val_loss'], label='Val Loss', alpha=0.7)
+    axes[0].plot(history.train_loss, label='Train Loss', alpha=0.7)
+    axes[0].plot(history.val_loss, label='Val Loss', alpha=0.7)
     axes[0].set_xlabel('Epoch')
     axes[0].set_ylabel('Negative ELBO')
     axes[0].set_title('Training History')
