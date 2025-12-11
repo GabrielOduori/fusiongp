@@ -34,6 +34,8 @@ Expected Runtime: ~5-10 minutes (CPU with 300 epochs)
 
 import sys
 import numpy as np
+import pandas as pd
+import torch
 import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
@@ -56,7 +58,7 @@ from src.visualization.spatial_maps import create_spatial_maps
 # =============================================================================
 
 # Data path (modify if needed)
-DATA_PATH = Path(__file__).parent.parent / "notebooks/synthetic_no2_data.csv"
+DATA_PATH = Path(__file__).parent.parent.parent / "data/test_data.csv"
 
 # Model hyperparameters (paper configuration)
 MODEL_CONFIG = {
@@ -203,7 +205,18 @@ def main():
             "Please ensure synthetic_no2_data.csv exists."
         )
 
-    loader = DataLoader(str(DATA_PATH))
+    loader = DataLoader(
+        str(DATA_PATH),
+        column_mapping={
+            "grid_id": "grid_id",
+            "latitude": "latitude",
+            "longitude": "longitude",
+            "timestamp": "timestamp",
+            "satellite": "satellite_values",
+            "low_cost": "low_cost_data",
+            "epa": "epa_no2",
+        },
+    )
     data = loader.load()
 
     preprocessor = DataPreprocessor(normalize_targets=True)
@@ -374,39 +387,50 @@ def main():
     # -------------------------------------------------------------------------
     print("\n[Step 8/8] Creating visualizations and saving results...")
 
-    # Create timestamped experiment folder
+    # Create timestamped experiment folder with organized subdirectories
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_results_dir = Path(__file__).resolve().parent / "results"
     experiment_dir = base_results_dir / f"experiment_{timestamp}"
-    experiment_dir.mkdir(parents=True, exist_ok=True)
+
+    # Create subdirectories for organized output
+    figures_dir = experiment_dir / "figures"
+    models_dir = experiment_dir / "models"
+    tables_dir = experiment_dir / "tables"
+
+    figures_dir.mkdir(parents=True, exist_ok=True)
+    models_dir.mkdir(parents=True, exist_ok=True)
+    tables_dir.mkdir(parents=True, exist_ok=True)
 
     print(f"\n{'='*70}")
     print(f"Saving results to: {experiment_dir}")
+    print(f"  - Figures: {figures_dir}")
+    print(f"  - Models: {models_dir}")
+    print(f"  - Tables: {tables_dir}")
     print(f"{'='*70}\n")
 
-    # Save experiment summary
+    # Save experiment summary to tables directory
     summary_file = save_experiment_summary(
-        experiment_dir, model, trainer, learned_params,
+        tables_dir, model, trainer, learned_params,
         epa_metrics, epa_train, epa_test, scalers, timestamp
     )
     print(f"   ✓ Experiment summary saved to: {summary_file}")
 
-    # Basic prediction plots
+    # Basic prediction plots - save to figures directory
     plot_predictions(
         coords=grid_predictions.coords,
         values=grid_predictions.mean,
-        save_path=str(experiment_dir / "predictions.png"),
+        save_path=str(figures_dir / "predictions.png"),
     )
     print(f"   ✓ Saved predictions plot")
 
     plot_uncertainty(
         coords=grid_predictions.coords,
         std=grid_predictions.std,
-        save_path=str(experiment_dir / "uncertainty.png"),
+        save_path=str(figures_dir / "uncertainty.png"),
     )
     print(f"   ✓ Saved uncertainty plot")
 
-    # EPA confidence interval plot
+    # EPA confidence interval plot - save to figures directory
     epa_mask = test_data.source_masks["epa"]
     if epa_mask.any():
         y_epa = y_true_orig["epa"][epa_mask]
@@ -420,12 +444,12 @@ def main():
             xlabel="EPA test index",
             ylabel="NO₂ (µg/m³)",
             title="EPA Predictions with Confidence Intervals",
-            save_path=str(experiment_dir / "uncertainty_ci.png"),
+            save_path=str(figures_dir / "uncertainty_ci.png"),
         )
         plt.close(fig_ci)
         print(f"   ✓ Saved confidence intervals plot")
 
-    # Enhanced spatial maps with contours
+    # Enhanced spatial maps with contours - save to figures directory
     print("\n   Creating enhanced spatial maps...")
     create_spatial_maps(
         predictor=predictor,
@@ -435,11 +459,11 @@ def main():
         n_times=4,
         nx=100,
         ny=100,
-        output_dir=str(experiment_dir / 'spatial_maps'),
+        output_dir=str(figures_dir / 'spatial_maps'),
         cmap_mean='RdYlBu_r',
         cmap_std='plasma',
     )
-    print(f"   ✓ Saved spatial maps to: {experiment_dir / 'spatial_maps'}")
+    print(f"   ✓ Saved spatial maps to: {figures_dir / 'spatial_maps'}")
 
     # Gridded surface plots (first timestamp)
     ts0 = np.unique(grid_predictions.timestamps)[0]
@@ -450,27 +474,97 @@ def main():
     mean_grid = grid_predictions.mean[mask].reshape(len(lat_unique), len(lon_unique))
     std_grid = grid_predictions.std[mask].reshape(len(lat_unique), len(lon_unique))
 
-    # Mean surface
+    # Mean surface - save to figures directory
     fig, ax = plt.subplots(figsize=(8, 6))
     pcm = ax.pcolormesh(lon_unique, lat_unique, mean_grid, shading="auto", cmap="RdYlBu_r")
     fig.colorbar(pcm, ax=ax, label="Mean NO₂ (µg/m³)")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"Gridded Mean Predictions (t={ts0:.2f})")
-    fig.savefig(experiment_dir / "predictions_surface.png", dpi=300, bbox_inches="tight")
+    fig.savefig(figures_dir / "predictions_surface.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"   ✓ Saved mean surface plot")
 
-    # Uncertainty surface
+    # Uncertainty surface - save to figures directory
     fig, ax = plt.subplots(figsize=(8, 6))
     pcm = ax.pcolormesh(lon_unique, lat_unique, std_grid, shading="auto", cmap="YlOrRd")
     fig.colorbar(pcm, ax=ax, label="Std Dev (µg/m³)")
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
     ax.set_title(f"Gridded Uncertainty (t={ts0:.2f})")
-    fig.savefig(experiment_dir / "uncertainty_surface.png", dpi=300, bbox_inches="tight")
+    fig.savefig(figures_dir / "uncertainty_surface.png", dpi=300, bbox_inches="tight")
     plt.close(fig)
     print(f"   ✓ Saved uncertainty surface plot")
+
+    # -------------------------------------------------------------------------
+    # Save Model and Additional Outputs
+    # -------------------------------------------------------------------------
+    print("\n   Saving model and metrics tables...")
+
+    # Save trained model to models directory
+    model_path = models_dir / "fusiongp_model.pth"
+    torch.save({
+        'model_state_dict': model.state_dict(),
+        'model_config': MODEL_CONFIG,
+        'training_config': TRAINING_CONFIG,
+        'learned_hyperparameters': learned_params,
+        'timestamp': timestamp,
+    }, model_path)
+    print(f"   ✓ Saved model to: {model_path}")
+
+    # Save metrics as CSV table
+    metrics_dict = metrics.to_dict()
+
+    # Per-source metrics table
+    per_source_data = []
+    for source in ['epa', 'low_cost', 'satellite']:
+        if source in metrics_dict:
+            source_metrics = metrics_dict[source]
+            row = {'source': source}
+            row.update(source_metrics)
+            per_source_data.append(row)
+
+    if per_source_data:
+        per_source_df = pd.DataFrame(per_source_data)
+        # Save as CSV
+        per_source_df.to_csv(tables_dir / "metrics_per_source.csv", index=False)
+        # Save as LaTeX
+        per_source_df.to_latex(
+            tables_dir / "metrics_per_source.tex",
+            index=False,
+            float_format="%.4f",
+            caption="Per-source evaluation metrics",
+            label="tab:metrics_per_source"
+        )
+        print(f"   ✓ Saved per-source metrics table (CSV + LaTeX)")
+
+    # EPA-only metrics table
+    epa_metrics_df = pd.DataFrame([epa_metrics.to_dict()])
+    # Save as CSV
+    epa_metrics_df.to_csv(tables_dir / "metrics_epa_only.csv", index=False)
+    # Save as LaTeX
+    epa_metrics_df.to_latex(
+        tables_dir / "metrics_epa_only.tex",
+        index=False,
+        float_format="%.4f",
+        caption="EPA-only evaluation metrics",
+        label="tab:metrics_epa"
+    )
+    print(f"   ✓ Saved EPA-only metrics table (CSV + LaTeX)")
+
+    # Save hyperparameters as CSV and LaTeX
+    hyperparams_df = pd.DataFrame([learned_params])
+    # Save as CSV
+    hyperparams_df.to_csv(tables_dir / "learned_hyperparameters.csv", index=False)
+    # Save as LaTeX
+    hyperparams_df.to_latex(
+        tables_dir / "learned_hyperparameters.tex",
+        index=False,
+        float_format="%.4f",
+        caption="Learned model hyperparameters",
+        label="tab:hyperparameters"
+    )
+    print(f"   ✓ Saved learned hyperparameters table (CSV + LaTeX)")
 
     # -------------------------------------------------------------------------
     # Summary
@@ -479,6 +573,10 @@ def main():
     print("Paper Reproduction Experiment Complete!")
     print("="*70)
     print(f"Results directory: {experiment_dir}")
+    print(f"\nOrganized outputs:")
+    print(f"  📊 Figures: {figures_dir.relative_to(experiment_dir.parent.parent)}")
+    print(f"  🤖 Models:  {models_dir.relative_to(experiment_dir.parent.parent)}")
+    print(f"  📋 Tables:  {tables_dir.relative_to(experiment_dir.parent.parent)}")
     print("\nKey Performance Metrics:")
     print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} µg/m³")
     print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} µg/m³")
