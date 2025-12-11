@@ -257,7 +257,6 @@ class DataLoader:
         
         # Load CSV
         df = pd.read_csv(self.filepath)
-        df = df.head(1500)
         logger.info(f"Loaded {len(df):,} rows from CSV")
         
         # Validate columns

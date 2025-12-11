@@ -267,9 +267,15 @@ class FusionSVGP(ApproximateGP):
         """
         n_data = x.shape[0]
         n_inducing = min(self.n_inducing, n_data)
-        
+
+        if n_inducing != self.n_inducing:
+            logger.warning(
+                f"Requested {self.n_inducing} inducing points, but only {n_data} data points available. "
+                f"Using {n_inducing} inducing points instead."
+            )
+
         logger.info(f"Initializing {n_inducing} inducing points using {method}")
-        
+
         if method == 'kmeans':
             # Use K-means clustering
             x_np = x.detach().cpu().numpy()
@@ -314,9 +320,30 @@ class FusionSVGP(ApproximateGP):
         else:
             raise ValueError(f"Unknown initialization method: {method}")
         
-        # Set inducing points
-        self.variational_strategy.inducing_points.data = inducing_points
-        
+        # If the number of inducing points changed, we need to reinitialize the variational strategy
+        if n_inducing != self.variational_strategy.inducing_points.shape[0]:
+            logger.info(
+                f"Reinitializing variational strategy with {n_inducing} inducing points "
+                f"(was {self.variational_strategy.inducing_points.shape[0]})"
+            )
+
+            # Create new variational distribution with correct size
+            variational_distribution = CholeskyVariationalDistribution(n_inducing)
+
+            # Create new variational strategy
+            variational_strategy = VariationalStrategy(
+                self,
+                inducing_points,
+                variational_distribution,
+                learn_inducing_locations=self.learn_inducing_locations,
+            )
+
+            # Replace the old variational strategy
+            self.variational_strategy = variational_strategy
+        else:
+            # Just update inducing points
+            self.variational_strategy.inducing_points.data = inducing_points
+
         logger.info(
             f"Inducing points initialized: shape={inducing_points.shape}, "
             f"bounds=[{inducing_points.min(0).values.tolist()}, "
