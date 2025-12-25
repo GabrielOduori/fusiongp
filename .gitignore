@@ -21,4 +21,6 @@ dist/
 build/
 *.csv
 
+docs/
+
 .coverage
