@@ -64,7 +64,7 @@ Where:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/fusiongp.git
+git clone https://github.com/GabrielOduori/fusionGP2.git
 cd fusiongp
 
 # Install dependencies
@@ -229,6 +229,6 @@ MIT License - see LICENSE file for details.
   title={FusionGP: Scalable Probabilistic Multi-Source NO₂ Fusion},
   author={Your Name},
   year={2024},
-  url={https://github.com/yourusername/fusiongp}
+  url={https://github.com/GabrielOduori/fusionGP2}
 }
 ```
