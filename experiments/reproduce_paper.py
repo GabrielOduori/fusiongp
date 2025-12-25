@@ -18,21 +18,31 @@ Usage:
 
 Outputs:
     results/experiment_YYYYMMDD_HHMMSS/
-    ├── experiment_summary.txt        # Configuration and metrics
-    ├── predictions.png               # Mean predictions
-    ├── uncertainty.png               # Uncertainty estimates
-    ├── uncertainty_ci.png            # Confidence intervals
-    ├── predictions_surface.png       # Gridded mean surface
-    ├── uncertainty_surface.png       # Gridded uncertainty surface
-    └── spatial_maps/                 # Time-series spatial maps
-        ├── mean_t0.png
-        ├── std_t0.png
-        └── ...
+    ├── figures/
+    │   ├── training_curves.png       # Loss curves and convergence
+    │   ├── predictions.png           # Mean predictions
+    │   ├── uncertainty.png           # Uncertainty estimates
+    │   ├── uncertainty_ci.png        # Confidence intervals
+    │   ├── predictions_surface.png   # Gridded mean surface
+    │   ├── uncertainty_surface.png   # Gridded uncertainty surface
+    │   └── spatial_maps/             # Time-series spatial maps
+    │       ├── mean_t0.png
+    │       ├── std_t0.png
+    │       └── ...
+    ├── models/
+    │   └── fusiongp_model.pth        # Trained model checkpoint
+    └── tables/
+        ├── experiment_summary.txt    # Configuration and metrics
+        ├── training_history.csv      # Training loss per epoch
+        ├── metrics_per_source.csv    # Per-source metrics
+        ├── metrics_epa_only.csv      # EPA-only metrics
+        └── learned_hyperparameters.csv
 
 Expected Runtime: ~5-10 minutes (CPU with 300 epochs)
 """
 
 import sys
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -40,6 +50,7 @@ import matplotlib.pyplot as plt
 from pathlib import Path
 from datetime import datetime
 from sklearn.neighbors import NearestNeighbors
+from tqdm import tqdm
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -58,16 +69,17 @@ from src.visualization.spatial_maps import create_spatial_maps
 # =============================================================================
 
 # Data path (modify if needed)
-DATA_PATH = Path(__file__).parent.parent.parent / "data/test_data.csv"
+# DATA_PATH = Path(__file__).parent.parent / "data/test_data.csv"
+DATA_PATH = Path(__file__).parent.parent / "data" / "dublin_realistic_no2.csv"
 
 # Model hyperparameters (paper configuration)
 MODEL_CONFIG = {
     "n_inducing": 800,  # High capacity for capturing local variations
     "kernel_type": "matern32",
     "learn_inducing_locations": True,
-    "learn_kernel_hyperparams": False,  # Fixed for reproducibility
-    "learn_noise": False,
-    "learn_calibration": False,
+    "learn_kernel_hyperparams": True,  # Enable learning for better fit
+    "learn_noise": True,  # Learn noise levels from data
+    "learn_calibration": True,  # Learn calibration for low-cost sensors
     "initial_lengthscales": {
         "spatial_x": 0.1,
         "spatial_y": 0.1,
@@ -82,7 +94,7 @@ MODEL_CONFIG = {
 
 # Training hyperparameters
 TRAINING_CONFIG = {
-    "learning_rate": 0.0005,
+    "learning_rate": 0.01,  # Higher learning rate for faster convergence
     "n_epochs": 300,
     "batch_size": 1024,
 }
@@ -135,8 +147,57 @@ def idw_predict(train_coords, train_vals, query_coords, k=8, power=2.0, eps=1e-1
     return preds
 
 
+def plot_training_curves(history, save_path):
+    """
+    Plot training and validation loss curves.
+
+    Args:
+        history: TrainingHistory object from trainer
+        save_path: Path to save the plot
+    """
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(14, 5))
+
+    # Plot 1: Training and Validation Loss
+    epochs_train = np.arange(1, len(history.train_loss) + 1)
+    ax1.plot(epochs_train, history.train_loss, 'b-', linewidth=2, label='Training Loss', alpha=0.8)
+
+    if history.val_loss:
+        # Validation is computed every val_interval epochs
+        val_interval = len(history.train_loss) // len(history.val_loss) if len(history.val_loss) > 1 else 5
+        epochs_val = np.arange(val_interval, len(history.train_loss) + 1, val_interval)[:len(history.val_loss)]
+        ax1.plot(epochs_val, history.val_loss, 'r-', linewidth=2, label='Validation Loss', alpha=0.8, marker='o')
+
+    ax1.set_xlabel('Epoch', fontsize=12)
+    ax1.set_ylabel('Loss (Negative ELBO)', fontsize=12)
+    ax1.set_title('Training Progress', fontsize=14, fontweight='bold')
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+
+    # Highlight best epoch if validation exists
+    if history.val_loss:
+        best_epoch = history.best_epoch
+        best_loss = history.best_val_loss
+        ax1.axvline(x=epochs_val[best_epoch], color='green', linestyle='--', linewidth=1.5, alpha=0.7, label='Best Model')
+        ax1.scatter([epochs_val[best_epoch]], [best_loss], color='green', s=100, zorder=5, marker='*')
+        ax1.legend(fontsize=10)
+
+    # Plot 2: Learning Rate Schedule
+    ax2.plot(epochs_train, history.learning_rates, 'g-', linewidth=2, alpha=0.8)
+    ax2.set_xlabel('Epoch', fontsize=12)
+    ax2.set_ylabel('Learning Rate', fontsize=12)
+    ax2.set_title('Learning Rate Schedule', fontsize=14, fontweight='bold')
+    ax2.grid(True, alpha=0.3)
+    ax2.set_yscale('log')
+
+    plt.tight_layout()
+    fig.savefig(save_path, dpi=300, bbox_inches='tight')
+    plt.close(fig)
+
+    return fig
+
+
 def save_experiment_summary(experiment_dir, model, trainer, learned_params,
-                            epa_metrics, epa_train, epa_test, scalers, timestamp):
+                            epa_metrics, epa_train, epa_test, scalers, timestamp, elapsed_time=None):
     """Save experiment configuration and results to text file."""
     summary_file = experiment_dir / "experiment_summary.txt"
 
@@ -144,7 +205,17 @@ def save_experiment_summary(experiment_dir, model, trainer, learned_params,
         f.write(f"FusionGP Paper Reproduction Experiment\n")
         f.write(f"{'='*70}\n")
         f.write(f"Timestamp: {timestamp}\n")
-        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        f.write(f"Date: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+        if elapsed_time is not None:
+            hours, remainder = divmod(elapsed_time, 3600)
+            minutes, seconds = divmod(remainder, 60)
+            if hours > 0:
+                f.write(f"Runtime: {int(hours)}h {int(minutes)}m {seconds:.2f}s ({elapsed_time:.2f} seconds)\n")
+            elif minutes > 0:
+                f.write(f"Runtime: {int(minutes)}m {seconds:.2f}s ({elapsed_time:.2f} seconds)\n")
+            else:
+                f.write(f"Runtime: {seconds:.2f} seconds\n")
+        f.write(f"\n")
 
         f.write(f"Model Configuration:\n")
         f.write(f"{'-'*70}\n")
@@ -190,19 +261,28 @@ def save_experiment_summary(experiment_dir, model, trainer, learned_params,
 # =============================================================================
 
 def main():
+    # Start timing
+    start_time = time.time()
+
     print("="*70)
     print("FusionGP Paper Reproduction Experiment")
     print("="*70)
 
+    # Create main progress bar for experiment steps
+    total_steps = 8
+    main_pbar = tqdm(total=total_steps, desc="Experiment Progress", position=0, leave=True,
+                     bar_format='{l_bar}{bar}| {n_fmt}/{total_fmt} steps [{elapsed}<{remaining}]')
+
     # -------------------------------------------------------------------------
     # 1. Load and Preprocess Data
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 1/8: Loading data")
     print("\n[Step 1/8] Loading and preprocessing data...")
 
     if not DATA_PATH.exists():
         raise FileNotFoundError(
             f"Data file not found at {DATA_PATH}. "
-            "Please ensure synthetic_no2_data.csv exists."
+            "Please ensure data exists."
         )
 
     loader = DataLoader(
@@ -225,30 +305,37 @@ def main():
 
     print(f"   ✓ Loaded {len(data.coords)} total observations")
     print(f"   ✓ Train: {len(train_data.coords)}, Val: {len(val_data.coords)}, Test: {len(test_data.coords)}")
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 2. Initialize Model
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 2/8: Initializing model")
     print("\n[Step 2/8] Initializing FusionSVGP model...")
 
     model = FusionSVGP(**MODEL_CONFIG)
     print(f"   ✓ Model initialized with {model.n_inducing} inducing points")
     print(model)
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 3. Train Model
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 3/8: Training model")
     print("\n[Step 3/8] Training model...")
 
     trainer = Trainer(model, **TRAINING_CONFIG)
     print(f"   ✓ Training config -> lr={trainer.learning_rate:.2e}, "
           f"epochs={trainer.n_epochs}, batch_size={trainer.batch_size}")
 
-    trainer.fit(train_data, val_data=val_data)
+    history = trainer.fit(train_data, val_data=val_data)
+    print(f"   ✓ Training complete. Best validation loss: {history.best_val_loss:.4f} at epoch {history.best_epoch + 1}")
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 4. Check Learned Parameters
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 4/8: Reviewing hyperparameters")
     print("\n[Step 4/8] Reviewing learned hyperparameters...")
 
     learned_params = model.get_hyperparameters()
@@ -274,14 +361,17 @@ def main():
           f"lon=[{train_data.coords[:,1].min():.4f}, {train_data.coords[:,1].max():.4f}]")
     print(f"Train time range: [{train_data.timestamps.min():.4f}, {train_data.timestamps.max():.4f}]")
     print("="*50 + "\n")
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 5. Make Predictions
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 5/8: Making predictions")
     print("\n[Step 5/8] Making predictions...")
 
-    # Create predictor WITH observation noise
-    predictor = Predictor(model, scalers, include_observation_noise=True, noise_source='epa')
+    # Create predictor WITHOUT observation noise for evaluation
+    # We want to evaluate the latent function, not noisy observations
+    predictor = Predictor(model, scalers, include_observation_noise=False)
 
     # Point predictions on test set
     predictions = predictor.predict(test_data)
@@ -307,10 +397,12 @@ def main():
         timestamps=timestamps,
         resolution=GRID_RESOLUTION,
     )
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 6. IDW Baseline Comparison
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 6/8: Computing IDW baseline")
     print("\n[Step 6/8] Computing IDW baseline...")
 
     epa_train_mask = train_data.source_masks['epa']
@@ -344,10 +436,12 @@ def main():
         print(f"   ✓ IDW baseline (EPA only): {baseline_metrics}")
     else:
         print("   ⚠ Skipping IDW baseline: no EPA points in train/test split.")
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 7. Evaluate FusionGP
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 7/8: Evaluating performance")
     print("\n[Step 7/8] Evaluating FusionGP performance...")
 
     # Denormalize targets
@@ -381,10 +475,12 @@ def main():
     for key, val in epa_metrics.to_dict().items():
         if isinstance(val, (int, float, np.number)):
             print(f"      {key}: {val:.4f}")
+    main_pbar.update(1)
 
     # -------------------------------------------------------------------------
     # 8. Visualize and Save Results
     # -------------------------------------------------------------------------
+    main_pbar.set_description("Step 8/8: Saving results")
     print("\n[Step 8/8] Creating visualizations and saving results...")
 
     # Create timestamped experiment folder with organized subdirectories
@@ -392,7 +488,7 @@ def main():
     base_results_dir = Path(__file__).resolve().parent / "results"
     experiment_dir = base_results_dir / f"experiment_{timestamp}"
 
-    # Create subdirectories for organized output
+    # Subdirectories for organized output
     figures_dir = experiment_dir / "figures"
     models_dir = experiment_dir / "models"
     tables_dir = experiment_dir / "tables"
@@ -408,12 +504,43 @@ def main():
     print(f"  - Tables: {tables_dir}")
     print(f"{'='*70}\n")
 
-    # Save experiment summary to tables directory
+    # Save experiment summary to tables directory (with current runtime)
+    current_elapsed = time.time() - start_time
     summary_file = save_experiment_summary(
         tables_dir, model, trainer, learned_params,
-        epa_metrics, epa_train, epa_test, scalers, timestamp
+        epa_metrics, epa_train, epa_test, scalers, timestamp, current_elapsed
     )
     print(f"   ✓ Experiment summary saved to: {summary_file}")
+
+    # Plot training curves - save to figures directory
+    plot_training_curves(
+        history=history,
+        save_path=str(figures_dir / "training_curves.png")
+    )
+    print(f"   ✓ Saved training curves plot")
+
+    # Save training history as CSV - save to tables directory
+    history_dict = history.to_dict()
+    # Create DataFrame with aligned data (validation is computed every val_interval)
+    max_len = len(history_dict['train_loss'])
+    history_data = {
+        'epoch': list(range(1, max_len + 1)),
+        'train_loss': history_dict['train_loss'],
+        'learning_rate': history_dict['learning_rate'],
+        'epoch_time': history_dict['epoch_time'],
+    }
+    # Add validation loss (sparse, only at validation epochs)
+    val_interval = max_len // len(history_dict['val_loss']) if len(history_dict['val_loss']) > 1 else 5
+    val_losses_full = [None] * max_len
+    for i, val_loss in enumerate(history_dict['val_loss']):
+        epoch_idx = (i + 1) * val_interval - 1
+        if epoch_idx < max_len:
+            val_losses_full[epoch_idx] = val_loss
+    history_data['val_loss'] = val_losses_full
+
+    history_df = pd.DataFrame(history_data)
+    history_df.to_csv(tables_dir / "training_history.csv", index=False)
+    print(f"   ✓ Saved training history table")
 
     # Basic prediction plots - save to figures directory
     plot_predictions(
@@ -565,23 +692,40 @@ def main():
         label="tab:hyperparameters"
     )
     print(f"   ✓ Saved learned hyperparameters table (CSV + LaTeX)")
+    main_pbar.update(1)
+
+    # Close the progress bar
+    main_pbar.close()
 
     # -------------------------------------------------------------------------
     # Summary
     # -------------------------------------------------------------------------
+    # Calculate elapsed time
+    end_time = time.time()
+    elapsed_time = end_time - start_time
+    hours, remainder = divmod(elapsed_time, 3600)
+    minutes, seconds = divmod(remainder, 60)
+
     print("\n" + "="*70)
     print("Paper Reproduction Experiment Complete!")
     print("="*70)
     print(f"Results directory: {experiment_dir}")
     print(f"\nOrganized outputs:")
-    print(f"  📊 Figures: {figures_dir.relative_to(experiment_dir.parent.parent)}")
-    print(f"  🤖 Models:  {models_dir.relative_to(experiment_dir.parent.parent)}")
-    print(f"  📋 Tables:  {tables_dir.relative_to(experiment_dir.parent.parent)}")
+    print(f"  Figures: {figures_dir.relative_to(experiment_dir.parent.parent)}")
+    print(f"  Models:  {models_dir.relative_to(experiment_dir.parent.parent)}")
+    print(f"   Tables:  {tables_dir.relative_to(experiment_dir.parent.parent)}")
     print("\nKey Performance Metrics:")
     print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} µg/m³")
     print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} µg/m³")
     print(f"  • R²:   {epa_metrics.to_dict()['r2']:.4f}")
     print(f"  • Bias: {epa_metrics.to_dict()['bias']:.4f} µg/m³")
+    print("\nTotal Runtime:")
+    if hours > 0:
+        print(f"  • {int(hours)}h {int(minutes)}m {seconds:.2f}s ({elapsed_time:.2f} seconds)")
+    elif minutes > 0:
+        print(f"  • {int(minutes)}m {seconds:.2f}s ({elapsed_time:.2f} seconds)")
+    else:
+        print(f"  • {seconds:.2f} seconds")
     print("="*70)
 
 

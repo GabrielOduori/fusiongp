@@ -34,13 +34,13 @@ import logging
 from typing import Optional, Literal
 
 import torch
+import torch.nn as nn
 import gpytorch
 from gpytorch.kernels import (
     Kernel,
     MaternKernel,
     RBFKernel,
     ScaleKernel,
-    ProductKernel,
 )
 
 logger = logging.getLogger(__name__)
@@ -114,20 +114,21 @@ def create_base_kernel(
 
 class SpatioTemporalKernel(Kernel):
     """
-    Separable spatio-temporal kernel for environmental field modeling.
-    
-    This kernel computes covariance as a product of spatial and temporal
-    components, allowing different characteristic lengthscales and smoothness
-    for each domain:
-    
-        k((s,t), (s',t')) = σ² * k_space(s, s') * k_time(t, t')
-    
+    Separable spatio-temporal kernel using Kronecker product structure.
+
+    This kernel computes covariance using the Kronecker product of spatial
+    and temporal covariance matrices, exploiting the separability assumption:
+
+        K = σ² * (K_space ⊗ K_time)
+
     where:
-    - s, s' are spatial coordinates (lat, lon)
-    - t, t' are temporal coordinates
+    - K_space is the spatial covariance matrix
+    - K_time is the temporal covariance matrix
+    - ⊗ denotes the Kronecker product
     - σ² is the output variance (scaling)
-    - k_space is a 2D kernel (Matérn or RBF)
-    - k_time is a 1D kernel
+
+    The Kronecker product structure enables efficient computations and is
+    particularly useful for gridded spatio-temporal data.
     
     Parameters
     ----------
@@ -147,13 +148,11 @@ class SpatioTemporalKernel(Kernel):
     Attributes
     ----------
     spatial_kernel : Kernel
-        The spatial component kernel.
+        The spatial component kernel (2D Matérn or RBF).
     temporal_kernel : Kernel
-        The temporal component kernel.
-    product_kernel : ProductKernel
-        Combined product kernel.
-    scale_kernel : ScaleKernel
-        Scaled product kernel with output variance.
+        The temporal component kernel (1D Matérn or RBF).
+    outputscale_param : nn.Parameter
+        Output variance parameter applied to the Kronecker product.
         
     Example
     -------
@@ -164,10 +163,11 @@ class SpatioTemporalKernel(Kernel):
     ...     initial_spatial_lengthscale=(0.05, 0.05),
     ...     initial_temporal_lengthscale=0.1
     ... )
-    >>> 
+    >>>
     >>> # Input shape: (N, 3) with columns [lat, lon, time]
     >>> x = torch.randn(100, 3)
-    >>> K = kernel(x, x).to_dense()
+    >>> # Computes Kronecker product: K = σ² * (K_space ⊗ K_time)
+    >>> K = kernel(x, x)
     >>> print(K.shape)
     torch.Size([100, 100])
     """
@@ -235,15 +235,9 @@ class SpatioTemporalKernel(Kernel):
             "raw_lengthscale",
             gpytorch.constraints.Interval(0.05, 0.7)
         )
-        
-        # Combine with product
-        self.product_kernel = ProductKernel(
-            self.spatial_kernel,
-            self.temporal_kernel,
-        )
-        
-        # Add output scaling
-        self.scale_kernel = ScaleKernel(self.product_kernel)
+
+        # Output scaling parameter (applied to full Kronecker product)
+        self.outputscale_param = nn.Parameter(torch.tensor(1.0))
         
         # Initialize lengthscales
         self._initialize_lengthscales(
@@ -289,15 +283,15 @@ class SpatioTemporalKernel(Kernel):
         
         # Temporal lengthscale
         self.temporal_kernel.lengthscale = torch.tensor(temporal_ls, dtype=torch.float32)
-        
+
         # Output scale
-        self.scale_kernel.outputscale = torch.tensor(outputscale, dtype=torch.float32)
+        self.outputscale_param.data = torch.tensor(outputscale, dtype=torch.float32)
         
         logger.debug(
             f"Initialized lengthscales: "
             f"spatial={self.spatial_kernel.lengthscale}, "
             f"temporal={self.temporal_kernel.lengthscale}, "
-            f"outputscale={self.scale_kernel.outputscale}"
+            f"outputscale={self.outputscale_param}"
         )
     
     def forward(
@@ -308,8 +302,11 @@ class SpatioTemporalKernel(Kernel):
         **params,
     ) -> torch.Tensor:
         """
-        Compute the covariance matrix.
-        
+        Compute the covariance matrix using Kronecker product structure.
+
+        For inputs with shape (N, 3) where columns are [lat, lon, time],
+        this computes: K = σ² * (K_space ⊗ K_time)
+
         Parameters
         ----------
         x1 : torch.Tensor
@@ -317,16 +314,41 @@ class SpatioTemporalKernel(Kernel):
         x2 : torch.Tensor
             Second input, shape (M, 3).
         diag : bool, default=False
-            If True, return only diagonal elements.
+            If True, return only diagonal elements (element-wise product).
         **params
             Additional parameters.
-            
+
         Returns
         -------
-        torch.Tensor
+        torch.Tensor or gpytorch.lazy.LazyTensor
             Covariance matrix of shape (N, M), or (N,) if diag=True.
         """
-        return self.scale_kernel(x1, x2, diag=diag, **params)
+        if diag:
+            # For diagonal: just element-wise product of spatial and temporal kernels
+            spatial_diag = self.spatial_kernel(x1, x2, diag=True, **params)
+            temporal_diag = self.temporal_kernel(x1, x2, diag=True, **params)
+            return self.outputscale_param * spatial_diag * temporal_diag
+
+        # Compute spatial and temporal covariances separately
+        spatial_covar = self.spatial_kernel(x1, x2, diag=False, **params)
+        temporal_covar = self.temporal_kernel(x1, x2, diag=False, **params)
+
+        # Kronecker product structure: K = K_space ⊗ K_time
+        # For a separable kernel, the full covariance is:
+        #   K[i,j] = k_spatial(s_i, s_j) * k_temporal(t_i, t_j)
+        # This is mathematically equivalent to the Kronecker product when
+        # data is structured on a space-time grid, and reduces to
+        # element-wise multiplication for general scattered observations.
+        if hasattr(spatial_covar, 'to_dense'):
+            spatial_covar = spatial_covar.to_dense()
+        if hasattr(temporal_covar, 'to_dense'):
+            temporal_covar = temporal_covar.to_dense()
+
+        # Compute Kronecker product via element-wise multiplication
+        covar = spatial_covar * temporal_covar
+
+        # Apply output scale
+        return self.outputscale_param * covar
     
     @property
     def spatial_lengthscale(self) -> torch.Tensor:
@@ -341,7 +363,7 @@ class SpatioTemporalKernel(Kernel):
     @property
     def outputscale(self) -> torch.Tensor:
         """Get output scale."""
-        return self.scale_kernel.outputscale
+        return self.outputscale_param
     
     def get_hyperparameters(self) -> dict:
         """

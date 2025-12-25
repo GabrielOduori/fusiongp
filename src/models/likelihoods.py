@@ -112,7 +112,7 @@ class MultiSourceLikelihood(Likelihood):
         sources: List[str] = None,
         initial_noise: Dict[str, float] = None,
         learn_noise: bool = True,
-        noise_bounds: Tuple[float, float] = (1.0, 100.0),  # Minimum 1.0 in normalized space for good calibration with high capacity models
+        noise_bounds: Tuple[float, float] = (0.01, 100.0),  # Allow learning low noise for normalized data
         initial_calibration: Dict[str, float] = None,
         learn_calibration: bool = True,
     ):
@@ -185,19 +185,16 @@ class MultiSourceLikelihood(Likelihood):
     def noise_std(self) -> Dict[str, torch.Tensor]:
         """
         Get noise standard deviations for each source.
-        
+
         Returns
         -------
         Dict[str, torch.Tensor]
-            Noise std per source (constrained to bounds).
+            Noise std per source (exp for positivity, no bounds).
         """
         result = {}
         for source in self.sources:
-            # exp for positivity, then clamp to bounds
-            noise = self.raw_noise[source].exp().clamp(
-                self.noise_bounds[0], 
-                self.noise_bounds[1]
-            )
+            # exp for positivity, NO CLAMPING - let model learn freely
+            noise = self.raw_noise[source].exp()
             result[source] = noise
         return result
     
@@ -215,13 +212,13 @@ class MultiSourceLikelihood(Likelihood):
     
     @property
     def lc_slope(self) -> torch.Tensor:
-        """Get low-cost sensor calibration slope (constrained positive)."""
-        return self.raw_lc_slope.exp().clamp(0.1, 10.0)
+        """Get low-cost sensor calibration slope (exp for positivity, no bounds)."""
+        return self.raw_lc_slope.exp()  # NO CLAMPING
     
     @property
     def lc_intercept(self) -> torch.Tensor:
-        """Get low-cost sensor calibration intercept."""
-        return self.raw_lc_intercept.clamp(-50.0, 50.0)
+        """Get low-cost sensor calibration intercept (no bounds)."""
+        return self.raw_lc_intercept  # NO CLAMPING
     
     def transform_latent(
         self,

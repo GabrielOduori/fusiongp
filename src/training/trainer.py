@@ -251,9 +251,10 @@ class Trainer:
         torch.optim.Optimizer
             Configured optimizer.
         """
-        # Collect all parameters
-        params = list(self.model.parameters()) + list(self.model.likelihood.parameters())
-        
+        # Collect all parameters (model.parameters() already includes likelihood parameters
+        # since likelihood is a submodule of the model)
+        params = list(self.model.parameters())
+
         if optimizer_type.lower() == 'adam':
             return torch.optim.Adam(
                 params,
@@ -433,7 +434,7 @@ class Trainer:
             # Gradient clipping
             if self.gradient_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
-                    list(self.model.parameters()) + list(self.model.likelihood.parameters()),
+                    self.model.parameters(),
                     self.gradient_clip
                 )
             

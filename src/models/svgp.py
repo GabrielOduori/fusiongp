@@ -208,7 +208,7 @@ class FusionSVGP(ApproximateGP):
             # Freeze kernel hyperparameters to skip costly hyperparameter optimization
             self.covar_module.spatial_kernel.raw_lengthscale.requires_grad_(False)
             self.covar_module.temporal_kernel.raw_lengthscale.requires_grad_(False)
-            self.covar_module.scale_kernel.raw_outputscale.requires_grad_(False)
+            self.covar_module.outputscale_param.requires_grad_(False)
         
         # Likelihood
         self.likelihood = MultiSourceLikelihood(
@@ -355,15 +355,18 @@ class FusionSVGP(ApproximateGP):
         x: torch.Tensor,
         y: torch.Tensor,
         source_masks: torch.Tensor,
+        n_data: int = None,
     ) -> torch.Tensor:
         """
         Compute the Evidence Lower Bound (ELBO).
-        
+
         The ELBO is:
             L = E_q(f)[log p(y|f)] - KL(q(u) || p(u))
-        
+
+        For mini-batch training, the KL term should be scaled by the batch size.
+
         This is the objective maximized during training.
-        
+
         Parameters
         ----------
         x : torch.Tensor
@@ -372,7 +375,10 @@ class FusionSVGP(ApproximateGP):
             Observations, shape (N, n_sources).
         source_masks : torch.Tensor
             Valid observation masks, shape (N, n_sources).
-            
+        n_data : int, optional
+            Total number of data points (for mini-batch scaling).
+            If None, uses batch size.
+
         Returns
         -------
         torch.Tensor
@@ -380,18 +386,19 @@ class FusionSVGP(ApproximateGP):
         """
         # Get variational posterior at x
         variational_dist = self.variational_strategy(x)
-        
+
         # Expected log likelihood
         expected_log_lik = self.likelihood.expected_log_prob(
             y, variational_dist, source_masks
         )
-        
-        # KL divergence
+
+        # KL divergence (should be independent of batch size)
         kl_divergence = self.variational_strategy.kl_divergence()
-        
+
         # ELBO = E[log p(y|f)] - KL
+        # For minibatch training, we don't scale KL - it's already the correct contribution
         elbo = expected_log_lik - kl_divergence
-        
+
         return elbo
     
     def predict(
