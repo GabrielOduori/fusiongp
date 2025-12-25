@@ -65,10 +65,10 @@ all = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/GabrielOduori/fusionGP2"
-Documentation = "https://github.com/GabrielOduori/fusionGP2#readme"
-Repository = "https://github.com/GabrielOduori/fusionGP2"
-Issues = "https://github.com/GabrielOduori/fusionGP2/issues"
+Homepage = "https://github.com/GabrielOduori/fusiongp"
+Documentation = "https://github.com/GabrielOduori/fusiongp#readme"
+Repository = "https://github.com/GabrielOduori/fusiongp"
+Issues = "https://github.com/GabrielOduori/fusiongp/issues"
 
 [tool.setuptools.packages.find]
 where = ["."]
