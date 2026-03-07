@@ -7,6 +7,8 @@ Reads GPKF and Kalman smoother daily CSVs and generates enhanced figures:
   - EPA station overlay
   - Percentile-clipped colourmaps
   - OpenStreetMap basemap via contextily
+  - Domain-averaged NO₂ time series (GPKF vs Kalman smoother)
+  - Daily EPA observed vs SVGP predicted time series
 
 Usage:
     python experiments/plot_publication_maps.py [run_dir]
@@ -440,6 +442,109 @@ def _attach_grid_id(df, lat_grid, lon_grid):
 
 
 # ---------------------------------------------------------------------------
+# Time series plots
+# ---------------------------------------------------------------------------
+
+def plot_timeseries(run_dir: Path, pub_dir: Path):
+    """
+    Generate two time series figures from saved pipeline outputs:
+
+    1. Domain-averaged NO₂ over time — GPKF and Kalman smoother mean ± 1σ
+       on the same axes, showing how the spatial field evolves day by day.
+
+    2. Daily EPA observed vs SVGP predicted — aggregated to daily means,
+       showing how well the fusion model tracks ground-truth EPA values.
+
+    Saved to pub_dir/timeseries_domain_average.png and
+    pub_dir/timeseries_epa_vs_svgp.png.
+    """
+    gpkf_dir   = run_dir / "gpkf_maps"
+    kalman_dir = run_dir / "kalman_maps"
+    preds_csv  = run_dir / "predictions.csv"
+    pub_dir.mkdir(parents=True, exist_ok=True)
+
+    # --- Panel 1: domain-averaged NO₂ over time ---
+    gpkf_csvs   = sorted(gpkf_dir.glob("gpkf_day_*.csv"))
+    kalman_csvs = sorted(kalman_dir.glob("kalman_day_*.csv")) if kalman_dir.exists() else []
+
+    def _domain_stats(csvs, mean_col="mean_ug_m3", std_col="std_ug_m3"):
+        days, means, stds = [], [], []
+        for i, p in enumerate(csvs):
+            df = pd.read_csv(p)
+            days.append(i)
+            means.append(df[mean_col].mean())
+            stds.append(df[std_col].mean())
+        return np.array(days), np.array(means), np.array(stds)
+
+    fig1, ax1 = plt.subplots(figsize=(11, 4))
+
+    if gpkf_csvs:
+        gdays, gmeans, gstds = _domain_stats(gpkf_csvs)
+        ax1.plot(gdays, gmeans, color="steelblue", linewidth=1.8, label="GPKF")
+        ax1.fill_between(gdays, gmeans - gstds, gmeans + gstds,
+                         alpha=0.20, color="steelblue")
+
+    if kalman_csvs:
+        kdays, kmeans, kstds = _domain_stats(kalman_csvs)
+        ax1.plot(kdays, kmeans, color="darkorange", linewidth=1.8,
+                 linestyle="--", label="Kalman smoother")
+        ax1.fill_between(kdays, kmeans - kstds, kmeans + kstds,
+                         alpha=0.15, color="darkorange")
+
+    ax1.set_xlabel("Day")
+    ax1.set_ylabel("NO₂ (µg/m³)")
+    ax1.set_title("Domain-averaged NO₂ over time (mean ± 1σ across grid cells)")
+    ax1.legend(fontsize=10)
+    ax1.grid(True, alpha=0.3)
+    fig1.tight_layout()
+    out1 = pub_dir / "timeseries_domain_average.png"
+    fig1.savefig(out1, dpi=DPI, bbox_inches="tight")
+    plt.close(fig1)
+    print(f"Saved: {out1}")
+
+    # --- Panel 2: daily EPA observed vs SVGP predicted ---
+    if not preds_csv.exists():
+        print(f"Skipping EPA time series: {preds_csv} not found")
+        return
+
+    df = pd.read_csv(preds_csv)
+    epa_df = df[df["is_epa"] == True].copy()
+    if epa_df.empty:
+        print("Skipping EPA time series: no EPA rows in predictions.csv")
+        return
+
+    # Aggregate to daily mean
+    daily = (
+        epa_df.groupby("timestamp")[["epa_true", "mean"]]
+        .mean()
+        .reset_index()
+        .sort_values("timestamp")
+    )
+    daily["day_idx"] = np.arange(len(daily))
+
+    fig2, ax2 = plt.subplots(figsize=(11, 4))
+    ax2.plot(daily["day_idx"], daily["epa_true"], "ko-",
+             markersize=5, linewidth=1.4, label="EPA observed (daily mean)")
+    ax2.plot(daily["day_idx"], daily["mean"], "s--",
+             color="steelblue", markersize=5, linewidth=1.4,
+             label="SVGP predicted (daily mean)")
+    ax2.set_xticks(daily["day_idx"])
+    ax2.set_xticklabels(
+        [str(t)[:10] for t in daily["timestamp"]],
+        rotation=45, ha="right", fontsize=8
+    )
+    ax2.set_ylabel("NO₂ (µg/m³)")
+    ax2.set_title("Daily EPA observations vs FusionSVGP predictions")
+    ax2.legend(fontsize=10)
+    ax2.grid(True, alpha=0.3)
+    fig2.tight_layout()
+    out2 = pub_dir / "timeseries_epa_vs_svgp.png"
+    fig2.savefig(out2, dpi=DPI, bbox_inches="tight")
+    plt.close(fig2)
+    print(f"Saved: {out2}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
@@ -510,6 +615,10 @@ def main():
             pred_csv, unc_csv, pub_dir / "svgp",
             epa_gdf, xmin, xmax, ymin, ymax,
         )
+
+    # Time series
+    print("\nGenerating time series plots ...")
+    plot_timeseries(run_dir, pub_dir / "timeseries")
 
     print(f"\nAll publication maps saved to: {pub_dir}")
 
