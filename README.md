@@ -60,6 +60,34 @@ flowchart TD
   J --> K
 ```
 
+## Maps and Visualisations
+
+After the pipeline has run, publication-quality maps can be regenerated at any time without re-running the full pipeline:
+
+```bash
+# Uses the most recent outputs/demo_run_* automatically
+python experiments/plot_publication_maps.py
+
+# Or point to a specific run directory
+python experiments/plot_publication_maps.py outputs/demo_run_20240601_120000
+```
+
+This reads the GPKF and Kalman smoother daily CSVs saved by the pipeline and produces per-day maps showing:
+
+- NO₂ mean concentration and uncertainty (std) side-by-side
+- Gaussian-smoothed heatmaps overlaid on an OpenStreetMap basemap
+- EPA station locations overlaid
+
+Maps are saved as high-resolution PNGs inside the run directory.
+
+**Optional:** For higher-quality basemap tiles, add a Stadia Maps API key to a `.env` file at the project root:
+
+```
+STADIA_API_KEY=your_key_here
+```
+
+Without a key, it falls back to CartoDB Positron tiles.
+
 ## Mathematical Formulation
 
 ### Generative Model
