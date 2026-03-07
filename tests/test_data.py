@@ -12,6 +12,7 @@ from pathlib import Path
 
 from src.data.loader import DataLoader, FusionData, FusionDataset
 from src.data.preprocessor import DataPreprocessor, Scalers
+from experiments.reproduce_paper import load_geojson_grid_centroids
 
 
 @pytest.fixture
@@ -51,7 +52,7 @@ class TestDataLoader:
         assert isinstance(data, FusionData)
         assert data.n_observations == 100
         assert data.coords.shape == (100, 2)
-        assert len(data.sources) == 3
+        assert len(data.sources) == 4  # epa, low_cost, satellite, traffic
     
     def test_load_with_missing(self, sample_csv):
         """Test that missing values are handled correctly."""
@@ -77,6 +78,82 @@ class TestDataLoader:
         
         assert "FusionData Summary" in summary
         assert "100" in summary  # Total observations
+
+    def test_drops_invalid_coords(self):
+        """Test dropping rows with NaN coordinates."""
+        df = pd.DataFrame({
+            "grid_id": [0, 1, 2],
+            "latitude": [40.7, np.nan, 40.8],
+            "longitude": [-74.0, -74.1, np.nan],
+            "timestamp": ["2024-01-01", "2024-01-01", "2024-01-01"],
+            "satellite_values": [10.0, 11.0, 12.0],
+            "low_cost_data": [9.0, 10.0, 11.0],
+            "epa_no2": [12.0, 13.0, 14.0],
+        })
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            df.to_csv(f, index=False)
+            path = f.name
+
+        loader = DataLoader(path)
+        data = loader.load()
+
+        assert data.n_observations == 1
+        assert data.coords.shape == (1, 2)
+
+    def test_drops_invalid_timestamps(self):
+        """Test dropping rows with unparseable timestamps."""
+        df = pd.DataFrame({
+            "grid_id": [0, 1, 2],
+            "latitude": [40.7, 40.71, 40.72],
+            "longitude": [-74.0, -74.01, -74.02],
+            "timestamp": ["2024-01-01", "bad_timestamp", "2024-01-03"],
+            "satellite_values": [10.0, 11.0, 12.0],
+            "low_cost_data": [9.0, 10.0, 11.0],
+            "epa_no2": [12.0, 13.0, 14.0],
+        })
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".csv", delete=False) as f:
+            df.to_csv(f, index=False)
+            path = f.name
+
+        loader = DataLoader(path)
+        data = loader.load()
+
+        assert data.n_observations == 2
+
+
+class TestGeojsonCentroids:
+    """Tests for centroid extraction from GeoJSON grids."""
+
+    def test_geojson_centroid_square(self):
+        geojson = {
+            "type": "FeatureCollection",
+            "features": [
+                {
+                    "type": "Feature",
+                    "properties": {"grid_id": 1},
+                    "geometry": {
+                        "type": "Polygon",
+                        "coordinates": [[
+                            [0.0, 0.0],
+                            [1.0, 0.0],
+                            [1.0, 1.0],
+                            [0.0, 1.0],
+                            [0.0, 0.0],
+                        ]]
+                    },
+                }
+            ],
+        }
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".geojson", delete=False) as f:
+            import json
+            json.dump(geojson, f)
+            path = f.name
+
+        df = load_geojson_grid_centroids(Path(path))
+        assert len(df) == 1
+        assert df.loc[0, "grid_id"] == 1
+        assert df.loc[0, "longitude"] == pytest.approx(0.5, rel=1e-6)
+        assert df.loc[0, "latitude"] == pytest.approx(0.5, rel=1e-6)
 
 
 class TestFusionData:
@@ -117,12 +194,13 @@ class TestFusionDataset:
         data = loader.load()
         dataset = FusionDataset(data)
         
-        coords, timestamp, obs, masks, idx = dataset[0]
+        coords, timestamp, obs, masks, idx, covariates = dataset[0]
         
         assert coords.shape == (2,)
         assert timestamp.dim() == 0
-        assert obs.shape == (3,)  # 3 sources
-        assert masks.shape == (3,)
+        assert obs.shape == (4,)  # 4 sources: epa, low_cost, satellite, traffic
+        assert masks.shape == (4,)
+        assert covariates.numel() == 0
     
     def test_get_input_tensor(self, sample_csv):
         """Test combined input tensor."""
@@ -131,8 +209,8 @@ class TestFusionDataset:
         dataset = FusionDataset(data)
         
         x = dataset.get_input_tensor()
-        
-        assert x.shape == (100, 3)  # lat, lon, time
+
+        assert x.shape[0] == 100  # 100 observations
 
 
 class TestDataPreprocessor:
@@ -194,6 +272,7 @@ class TestScalers:
         scalers = Scalers(
             coord_min=np.array([40.0, -74.0]),
             coord_max=np.array([41.0, -73.0]),
+            coord_scale=1.0,
             time_min=0.0,
             time_max=10.0,
         )
@@ -210,6 +289,7 @@ class TestScalers:
         scalers = Scalers(
             coord_min=np.array([0.0, 0.0]),
             coord_max=np.array([1.0, 1.0]),
+            coord_scale=1.0,
             time_min=0.0,
             time_max=30.0,
         )

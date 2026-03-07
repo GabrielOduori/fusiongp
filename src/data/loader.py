@@ -60,6 +60,8 @@ class FusionData:
         Grid cell identifiers for each observation.
     raw_timestamps : np.ndarray
         Original timestamp values before numerical conversion.
+    covariates : np.ndarray
+        Optional covariate matrix, shape (N, K).
     metadata : Dict
         Additional metadata about the dataset.
         
@@ -81,6 +83,7 @@ class FusionData:
     source_masks: Dict[str, np.ndarray]
     grid_ids: np.ndarray
     raw_timestamps: np.ndarray
+    covariates: Optional[np.ndarray] = None
     metadata: Dict = field(default_factory=dict)
     
     def __post_init__(self):
@@ -88,6 +91,8 @@ class FusionData:
         n_obs = len(self.coords)
         assert len(self.timestamps) == n_obs, "Timestamps length mismatch"
         assert len(self.grid_ids) == n_obs, "Grid IDs length mismatch"
+        if self.covariates is not None:
+            assert len(self.covariates) == n_obs, "Covariates length mismatch"
         for source, obs in self.observations.items():
             assert len(obs) == n_obs, f"Observations length mismatch for {source}"
         for source, mask in self.source_masks.items():
@@ -143,6 +148,8 @@ class FusionData:
             n_valid = self.source_masks[source].sum()
             pct = 100 * n_valid / self.n_observations
             lines.append(f"  {source}: {n_valid:,} ({pct:.1f}%)")
+        if self.covariates is not None:
+            lines.append(f"\nCovariates: {self.covariates.shape[1]}")
         return "\n".join(lines)
 
 
@@ -167,6 +174,7 @@ class DataLoader:
         - 'satellite': 'satellite_values'
         - 'low_cost': 'low_cost_data'
         - 'epa': 'epa_no2'
+        - 'traffic': 'traffic_volume'
     
     Attributes
     ----------
@@ -203,12 +211,14 @@ class DataLoader:
         'satellite': 'satellite_values',
         'low_cost': 'low_cost_data',
         'epa': 'epa_no2',
+        'traffic': 'traffic_volume',
     }
     
     def __init__(
         self,
         filepath: Union[str, Path],
         column_mapping: Optional[Dict[str, str]] = None,
+        covariate_columns: Optional[List[str]] = None,
     ):
         """
         Initialize the DataLoader.
@@ -220,11 +230,14 @@ class DataLoader:
         column_mapping : Dict[str, str], optional
             Custom column name mapping. Only need to specify columns that
             differ from defaults.
+        covariate_columns : List[str], optional
+            Additional covariate columns to include as model inputs.
         """
         self.filepath = Path(filepath)
         self.column_mapping = {**self.DEFAULT_COLUMNS}
         if column_mapping:
             self.column_mapping.update(column_mapping)
+        self.covariate_columns = covariate_columns or []
         self._data: Optional[FusionData] = None
         
         logger.info(f"Initialized DataLoader for {self.filepath}")
@@ -289,7 +302,7 @@ class DataLoader:
             If required columns are missing.
         """
         required = ['grid_id', 'latitude', 'longitude', 'timestamp']
-        observation_cols = ['satellite', 'low_cost', 'epa']
+        observation_cols = ['satellite', 'low_cost', 'epa', 'traffic']
         
         # Check required columns
         missing_required = []
@@ -334,8 +347,6 @@ class DataLoader:
         FusionData
             Processed data container.
         """
-        n_rows = len(df)
-        
         # Extract coordinates
         lat_col = self.column_mapping['latitude']
         lon_col = self.column_mapping['longitude']
@@ -344,10 +355,36 @@ class DataLoader:
             df[lon_col].values
         ])
         
+        coord_finite = np.isfinite(coords).all(axis=1)
+        if not coord_finite.all():
+            dropped = int((~coord_finite).sum())
+            logger.warning(f"Dropping {dropped} rows with NaN/inf coordinates")
+            df = df.loc[coord_finite].copy()
+            coords = coords[coord_finite]
+        
+        n_rows = len(df)
+        
         # Extract and convert timestamps
         ts_col = self.column_mapping['timestamp']
         raw_timestamps = df[ts_col].values
         timestamps = self._convert_timestamps(df[ts_col])
+
+        ts_finite = np.isfinite(timestamps)
+        if not ts_finite.all():
+            dropped = int((~ts_finite).sum())
+            logger.warning(f"Dropping {dropped} rows with NaN/inf timestamps")
+            df = df.loc[ts_finite].copy()
+            coords = coords[ts_finite]
+            raw_timestamps = raw_timestamps[ts_finite]
+            timestamps = timestamps[ts_finite]
+
+        # Refresh row count and realign coords defensively after filtering.
+        n_rows = len(df)
+        if len(coords) != n_rows:
+            coords = np.column_stack([
+                df[lat_col].values,
+                df[lon_col].values
+            ])
         
         # Extract grid IDs
         grid_ids = df[self.column_mapping['grid_id']].values
@@ -356,7 +393,7 @@ class DataLoader:
         observations = {}
         source_masks = {}
         
-        for source_key in ['epa', 'low_cost', 'satellite']:
+        for source_key in ['epa', 'low_cost', 'satellite', 'traffic']:
             col_name = self.column_mapping[source_key]
             if col_name in df.columns:
                 values = df[col_name].values.astype(np.float64)
@@ -386,10 +423,20 @@ class DataLoader:
                 'lon_max': coords[:, 1].max(),
             },
             'time_bounds': {
-                'min': raw_timestamps.min(),
-                'max': raw_timestamps.max(),
+                # Mixed timestamp types can break numpy min/max; normalize to strings for metadata.
+                'min': df[ts_col].astype(str).min(),
+                'max': df[ts_col].astype(str).max(),
             },
         }
+
+        # Extract covariates if provided
+        covariates = None
+        if self.covariate_columns:
+            missing_covars = [c for c in self.covariate_columns if c not in df.columns]
+            if missing_covars:
+                raise ValueError(f"Missing covariate columns: {missing_covars}")
+            covariates = df[self.covariate_columns].values.astype(np.float64)
+            metadata['covariate_names'] = list(self.covariate_columns)
         
         return FusionData(
             coords=coords,
@@ -398,6 +445,7 @@ class DataLoader:
             source_masks=source_masks,
             grid_ids=grid_ids,
             raw_timestamps=raw_timestamps,
+            covariates=covariates,
             metadata=metadata,
         )
     
@@ -418,16 +466,16 @@ class DataLoader:
         np.ndarray
             Numerical timestamp values.
         """
-        # Try to parse as datetime
-        try:
-            dt = pd.to_datetime(timestamps)
+        # Try to parse as datetime (coerce invalid to NaT)
+        dt = pd.to_datetime(timestamps, errors="coerce")
+        if dt.notna().any():
             # Convert to days since first observation
             days = (dt - dt.min()).dt.total_seconds() / (24 * 3600)
             return days.values
-        except (ValueError, TypeError):
-            # Already numerical
-            values = timestamps.values.astype(np.float64)
-            return values
+
+        # Fallback: attempt numeric conversion
+        values = pd.to_numeric(timestamps, errors="coerce").values.astype(np.float64)
+        return values
     
     def _validate_data(self, data: FusionData) -> None:
         """
@@ -479,7 +527,7 @@ class FusionDataset(Dataset):
     
     This dataset provides efficient access to multi-source observations for
     stochastic variational inference. Each sample contains the spatio-temporal
-    coordinates, observation values, and source indicators.
+    coordinates, observation values, source indicators, and optional covariates.
     
     Parameters
     ----------
@@ -498,6 +546,8 @@ class FusionDataset(Dataset):
         Stacked observations from all sources, shape (N, n_sources).
     source_masks : torch.Tensor
         Boolean masks for valid observations, shape (N, n_sources).
+    covariates : torch.Tensor
+        Optional covariates, shape (N, K).
     source_names : List[str]
         Names of sources in order.
         
@@ -506,7 +556,7 @@ class FusionDataset(Dataset):
     >>> dataset = FusionDataset(data, sources=['epa', 'low_cost', 'satellite'])
     >>> loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=True)
     >>> for batch in loader:
-    ...     coords, timestamps, obs, masks, indices = batch
+    ...     coords, timestamps, obs, masks, indices, covariates = batch
     ...     # Train step
     """
     
@@ -541,7 +591,14 @@ class FusionDataset(Dataset):
         self.source_masks = torch.tensor(
             np.column_stack(mask_list), dtype=torch.bool
         )
-        
+
+        # Covariates (optional)
+        if data.covariates is not None:
+            covariates = data.covariates
+        else:
+            covariates = np.empty((len(self.coords), 0), dtype=np.float32)
+        self.covariates = torch.tensor(covariates, dtype=torch.float32)
+
         # Replace NaN with 0 (masked out anyway)
         self.observations = torch.nan_to_num(self.observations, nan=0.0)
         
@@ -575,6 +632,8 @@ class FusionDataset(Dataset):
             Valid observation mask, shape (n_sources,).
         index : torch.Tensor
             Original index (for tracking).
+        covariates : torch.Tensor
+            Covariates, shape (K,).
         """
         return (
             self.coords[idx],
@@ -582,21 +641,27 @@ class FusionDataset(Dataset):
             self.observations[idx],
             self.source_masks[idx],
             torch.tensor(idx, dtype=torch.long),
+            self.covariates[idx],
         )
     
     def get_input_tensor(self) -> torch.Tensor:
         """
-        Get the full input tensor (coords + timestamps).
+        Get the full input tensor (coords + timestamps + covariates).
         
         Returns
         -------
         torch.Tensor
-            Combined input tensor, shape (N, 3) with columns [lat, lon, time].
+            Combined input tensor, shape (N, 3 + K) with columns
+            [lat, lon, time, covariates...].
         """
-        return torch.cat([
-            self.coords,
-            self.timestamps.unsqueeze(-1)
-        ], dim=-1)
+        return torch.cat(
+            [
+                self.coords,
+                self.timestamps.unsqueeze(-1),
+                self.covariates,
+            ],
+            dim=-1,
+        )
     
     def get_source_data(self, source: str) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """

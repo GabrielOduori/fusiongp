@@ -77,6 +77,27 @@ def rmse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     return np.sqrt(np.mean((y_true - y_pred) ** 2))
 
 
+def mse(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Mean Squared Error.
+    
+    MSE = mean((y_true - y_pred)²)
+    
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True values.
+    y_pred : np.ndarray
+        Predicted values.
+        
+    Returns
+    -------
+    float
+        MSE value.
+    """
+    return np.mean((y_true - y_pred) ** 2)
+
+
 def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
     """
     Mean Absolute Error.
@@ -96,33 +117,6 @@ def mae(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         MAE value.
     """
     return np.mean(np.abs(y_true - y_pred))
-
-
-def r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
-    """
-    Coefficient of Determination (R²).
-    
-    R² = 1 - SS_res / SS_tot
-    
-    Parameters
-    ----------
-    y_true : np.ndarray
-        True values.
-    y_pred : np.ndarray
-        Predicted values.
-        
-    Returns
-    -------
-    float
-        R² value.
-    """
-    ss_res = np.sum((y_true - y_pred) ** 2)
-    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
-    
-    if ss_tot == 0:
-        return 0.0
-    
-    return 1 - (ss_res / ss_tot)
 
 
 def bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
@@ -146,6 +140,31 @@ def bias(y_true: np.ndarray, y_pred: np.ndarray) -> float:
         Bias value.
     """
     return np.mean(y_pred - y_true)
+
+
+def r_squared(y_true: np.ndarray, y_pred: np.ndarray) -> float:
+    """
+    Coefficient of Determination (R²).
+
+    R² = 1 - SS_res / SS_tot
+
+    Parameters
+    ----------
+    y_true : np.ndarray
+        True values.
+    y_pred : np.ndarray
+        Predicted values.
+
+    Returns
+    -------
+    float
+        R² value. 1.0 is perfect prediction; 0.0 means no better than mean.
+    """
+    ss_res = np.sum((y_true - y_pred) ** 2)
+    ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+    if ss_tot == 0:
+        return 1.0 if ss_res == 0 else 0.0
+    return 1.0 - ss_res / ss_tot
 
 
 def mape(y_true: np.ndarray, y_pred: np.ndarray, epsilon: float = 1e-8) -> float:
@@ -710,8 +729,8 @@ class Evaluator:
         # Point metrics
         point_metrics = {
             'rmse': rmse(y_true, y_pred_mean),
+            'mse': mse(y_true, y_pred_mean),
             'mae': mae(y_true, y_pred_mean),
-            'r2': r_squared(y_true, y_pred_mean),
             'bias': bias(y_true, y_pred_mean),
             'mape': mape(y_true, y_pred_mean),
         }

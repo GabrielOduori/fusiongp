@@ -12,6 +12,8 @@ results/
 *.jpg
 *.pdf
 *.svg
+Data/
+example_test/
 
 # Logs
 *.log

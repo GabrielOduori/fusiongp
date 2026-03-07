@@ -24,3 +24,7 @@ build/
 docs/
 
 .coverage
+
+# Talk materials (presentation-specific)
+/talk.env
+METHODOLOGY.md

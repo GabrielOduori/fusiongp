@@ -63,6 +63,8 @@ class MultiSourceLikelihood(Likelihood):
         Default: {'epa': 1.0, 'low_cost': 5.0, 'satellite': 3.0}
     learn_noise : bool, default=True
         Whether to learn noise parameters.
+    learn_noise_sources : List[str], optional
+        Subset of sources to learn noise for. If None, uses learn_noise for all.
     noise_bounds : Tuple[float, float], default=(0.01, 100.0)
         Bounds for noise standard deviations.
     initial_calibration : Dict[str, float], optional
@@ -112,6 +114,7 @@ class MultiSourceLikelihood(Likelihood):
         sources: List[str] = None,
         initial_noise: Dict[str, float] = None,
         learn_noise: bool = True,
+        learn_noise_sources: Optional[List[str]] = None,
         noise_bounds: Tuple[float, float] = (0.01, 100.0),  # Allow learning low noise for normalized data
         initial_calibration: Dict[str, float] = None,
         learn_calibration: bool = True,
@@ -127,6 +130,8 @@ class MultiSourceLikelihood(Likelihood):
             Initial noise std per source.
         learn_noise : bool
             Learn noise parameters.
+        learn_noise_sources : List[str], optional
+            Subset of sources to learn noise for.
         noise_bounds : Tuple[float, float]
             Noise std bounds.
         initial_calibration : Dict[str, float]
@@ -152,6 +157,7 @@ class MultiSourceLikelihood(Likelihood):
         # Store bounds
         self.noise_bounds = noise_bounds
         self.learn_noise = learn_noise
+        self.learn_noise_sources = learn_noise_sources
         self.learn_calibration = learn_calibration
         
         # Create noise parameters (stored in log space for positivity)
@@ -160,20 +166,40 @@ class MultiSourceLikelihood(Likelihood):
             init_val = noise_init.get(source, 1.0)
             # Store as log(noise_std) for unconstrained optimization
             raw_val = torch.tensor(init_val).log()
+            requires_grad = learn_noise
+            if learn_noise_sources is not None:
+                requires_grad = learn_noise and (source in learn_noise_sources)
             self.raw_noise[source] = nn.Parameter(
                 raw_val,
-                requires_grad=learn_noise
+                requires_grad=requires_grad
             )
         
-        # Calibration parameters for low-cost sensors
+        # Calibration parameters for low-cost sensors (only if low_cost is used)
         # y_lc = slope * f + intercept
-        self.raw_lc_slope = nn.Parameter(
-            torch.tensor(calib_init['slope']).log(),  # log for positivity
-            requires_grad=learn_calibration
+        if 'low_cost' in self.sources:
+            self.raw_lc_slope = nn.Parameter(
+                torch.tensor(calib_init['slope']).log(),  # log for positivity
+                requires_grad=learn_calibration
+            )
+            self.raw_lc_intercept = nn.Parameter(
+                torch.tensor(calib_init['intercept']),
+                requires_grad=learn_calibration
+            )
+        else:
+            self.raw_lc_slope = None
+            self.raw_lc_intercept = None
+
+        # Calibration parameters for satellite
+        # y_sat = sat_slope * f + sat_intercept
+        # Satellite measures column NO2 (different units from ground-level EPA),
+        # so it needs its own linear transform to relate to the latent field.
+        self.raw_sat_slope = nn.Parameter(
+            torch.tensor(1.0).log(),  # Start at slope=1 (identity)
+            requires_grad=learn_calibration and ('satellite' in self.sources)
         )
-        self.raw_lc_intercept = nn.Parameter(
-            torch.tensor(calib_init['intercept']),
-            requires_grad=learn_calibration
+        self.raw_sat_intercept = nn.Parameter(
+            torch.tensor(0.0),  # Start at intercept=0
+            requires_grad=learn_calibration and ('satellite' in self.sources)
         )
         
         logger.info(
@@ -213,13 +239,27 @@ class MultiSourceLikelihood(Likelihood):
     @property
     def lc_slope(self) -> torch.Tensor:
         """Get low-cost sensor calibration slope (exp for positivity, no bounds)."""
+        if self.raw_lc_slope is None:
+            raise ValueError("low_cost calibration requested but 'low_cost' not in sources.")
         return self.raw_lc_slope.exp()  # NO CLAMPING
     
     @property
     def lc_intercept(self) -> torch.Tensor:
         """Get low-cost sensor calibration intercept (no bounds)."""
+        if self.raw_lc_intercept is None:
+            raise ValueError("low_cost calibration requested but 'low_cost' not in sources.")
         return self.raw_lc_intercept  # NO CLAMPING
-    
+
+    @property
+    def sat_slope(self) -> torch.Tensor:
+        """Get satellite calibration slope (exp for positivity)."""
+        return self.raw_sat_slope.exp()
+
+    @property
+    def sat_intercept(self) -> torch.Tensor:
+        """Get satellite calibration intercept."""
+        return self.raw_sat_intercept
+
     def transform_latent(
         self,
         f: torch.Tensor,
@@ -227,19 +267,19 @@ class MultiSourceLikelihood(Likelihood):
     ) -> torch.Tensor:
         """
         Transform latent function values for a specific source.
-        
+
         Applies the link function h_q(f) for each source:
-        - EPA: h(f) = f
-        - Low-cost: h(f) = a*f + b
-        - Satellite: h(f) = f
-        
+        - EPA: h(f) = f  (reference source)
+        - Low-cost: h(f) = a_lc * f + b_lc
+        - Satellite: h(f) = a_sat * f + b_sat
+
         Parameters
         ----------
         f : torch.Tensor
             Latent function values.
         source : str
             Source name.
-            
+
         Returns
         -------
         torch.Tensor
@@ -247,6 +287,8 @@ class MultiSourceLikelihood(Likelihood):
         """
         if source == 'low_cost':
             return self.lc_slope * f + self.lc_intercept
+        elif source == 'satellite':
+            return self.sat_slope * f + self.sat_intercept
         else:
             return f
     
@@ -274,6 +316,8 @@ class MultiSourceLikelihood(Likelihood):
         """
         if source == 'low_cost':
             return (y - self.lc_intercept) / self.lc_slope
+        elif source == 'satellite':
+            return (y - self.sat_intercept) / self.sat_slope
         else:
             return y
     
@@ -306,9 +350,12 @@ class MultiSourceLikelihood(Likelihood):
         # Transform mean for source
         transformed_mean = self.transform_latent(mean, source)
         
-        # Transform covariance for low-cost (scale by slope^2)
+        # Transform covariance for calibrated sources (scale by slope^2)
         if source == 'low_cost':
             scale = self.lc_slope ** 2
+            transformed_covar = covar * scale
+        elif source == 'satellite':
+            scale = self.sat_slope ** 2
             transformed_covar = covar * scale
         else:
             transformed_covar = covar
@@ -370,9 +417,11 @@ class MultiSourceLikelihood(Likelihood):
             # Transform latent to observation space
             obs_mean = self.transform_latent(f_m, source)
             
-            # Transform variance for low-cost
+            # Transform variance for calibrated sources
             if source == 'low_cost':
                 obs_var = (self.lc_slope ** 2) * f_v
+            elif source == 'satellite':
+                obs_var = (self.sat_slope ** 2) * f_v
             else:
                 obs_var = f_v
             
@@ -428,8 +477,11 @@ class MultiSourceLikelihood(Likelihood):
             f'noise_std_{s}': self.noise_std[s].detach() 
             for s in self.sources
         }
-        params['lc_slope'] = self.lc_slope.detach()
-        params['lc_intercept'] = self.lc_intercept.detach()
+        if 'low_cost' in self.sources:
+            params['lc_slope'] = self.lc_slope.detach()
+            params['lc_intercept'] = self.lc_intercept.detach()
+        params['sat_slope'] = self.sat_slope.detach()
+        params['sat_intercept'] = self.sat_intercept.detach()
         return params
     
     def __repr__(self) -> str:
@@ -438,10 +490,136 @@ class MultiSourceLikelihood(Likelihood):
             f"{s}={self.noise_std[s].item():.3f}" 
             for s in self.sources
         )
-        return (
-            f"MultiSourceLikelihood(\n"
-            f"  noise_std: {noise_str}\n"
-            f"  lc_calibration: slope={self.lc_slope.item():.3f}, "
-            f"intercept={self.lc_intercept.item():.3f}\n"
-            f")"
+        lines = [
+            "MultiSourceLikelihood(",
+            f"  noise_std: {noise_str}",
+        ]
+        if 'low_cost' in self.sources:
+            lines.append(
+                f"  lc_calibration: slope={self.lc_slope.item():.3f}, "
+                f"intercept={self.lc_intercept.item():.3f}"
+            )
+        lines.append(")")
+        return "\n".join(lines)
+
+
+class MaskedMultitaskGaussianLikelihood(Likelihood):
+    """
+    Masked multitask Gaussian likelihood with per-task noise.
+
+    This likelihood supports missing observations via per-task masks.
+    """
+
+    DEFAULT_NOISE = {
+        'epa': 1.0,
+        'low_cost': 5.0,
+        'satellite': 3.0,
+    }
+
+    def __init__(
+        self,
+        sources: List[str] = None,
+        initial_noise: Dict[str, float] = None,
+        learn_noise: bool = True,
+        learn_noise_sources: Optional[List[str]] = None,
+    ):
+        super().__init__()
+
+        self.sources = sources if sources else ['epa', 'low_cost', 'satellite']
+        self.source_to_idx = {s: i for i, s in enumerate(self.sources)}
+
+        noise_init = {**self.DEFAULT_NOISE}
+        if initial_noise:
+            noise_init.update(initial_noise)
+
+        self.learn_noise = learn_noise
+        self.learn_noise_sources = learn_noise_sources
+
+        self.raw_noise = nn.ParameterDict()
+        for source in self.sources:
+            init_val = noise_init.get(source, 1.0)
+            raw_val = torch.tensor(init_val).log()
+            requires_grad = learn_noise
+            if learn_noise_sources is not None:
+                requires_grad = learn_noise and (source in learn_noise_sources)
+            self.raw_noise[source] = nn.Parameter(raw_val, requires_grad=requires_grad)
+
+        logger.info(
+            f"Created MaskedMultitaskGaussianLikelihood: sources={self.sources}, "
+            f"learn_noise={learn_noise}"
         )
+
+    @property
+    def noise_std(self) -> Dict[str, torch.Tensor]:
+        return {s: self.raw_noise[s].exp() for s in self.sources}
+
+    @property
+    def noise_variance(self) -> Dict[str, torch.Tensor]:
+        return {s: n**2 for s, n in self.noise_std.items()}
+
+    def forward(
+        self,
+        function_dist: MultivariateNormal,
+        **kwargs,
+    ) -> MultivariateNormal:
+        # Keep latent distribution unchanged; noise is handled explicitly.
+        return function_dist
+
+    def expected_log_prob(
+        self,
+        observations: torch.Tensor,
+        function_dist: MultivariateNormal,
+        source_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        return self.log_marginal(observations, function_dist, source_masks)
+
+    def log_marginal(
+        self,
+        observations: torch.Tensor,
+        function_dist: MultivariateNormal,
+        source_masks: torch.Tensor,
+    ) -> torch.Tensor:
+        f_mean = function_dist.mean
+        f_var = function_dist.variance
+
+        total_log_prob = torch.tensor(0.0, device=f_mean.device, dtype=f_mean.dtype)
+
+        for source_idx, source in enumerate(self.sources):
+            mask = source_masks[:, source_idx]
+            if not mask.any():
+                continue
+
+            y = observations[mask, source_idx]
+            f_m = f_mean[mask, source_idx]
+            f_v = f_var[mask, source_idx]
+
+            noise_var = self.noise_variance[source]
+            total_var = f_v + noise_var
+
+            log_prob = -0.5 * (
+                torch.log(2 * torch.pi * total_var) +
+                (y - f_m) ** 2 / total_var
+            )
+            total_log_prob = total_log_prob + log_prob.sum()
+
+        return total_log_prob
+
+    def __repr__(self) -> str:
+        noise_str = ", ".join(
+            f"{s}={self.noise_std[s].item():.3f}"
+            for s in self.sources
+        )
+        return (
+            "MaskedMultitaskGaussianLikelihood(\n"
+            f"  noise_std: {noise_str}\n"
+            ")"
+        )
+
+    def get_parameters(self) -> Dict[str, torch.Tensor]:
+        """
+        Get likelihood parameters as a dictionary.
+        """
+        return {
+            f"noise_std_{s}": self.noise_std[s].detach()
+            for s in self.sources
+        }

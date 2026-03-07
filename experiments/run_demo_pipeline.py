@@ -1,0 +1,1441 @@
+"""
+End-to-end pipeline
+
+Steps:
+- Build merged daily dataset from individual sources
+- Load data with covariates
+- Preprocess/split
+- Build LUR prior mean
+- Train FusionSVGP
+- Predict/evaluate
+- Save plots and model
+
+Usage
+-----
+    # Standard run (M=300, 200 epochs):
+    python run_demo_pipeline.py
+
+    # Run pipeline then M-sweep for RQ2:
+    python run_demo_pipeline.py --sweep
+
+    # Custom sweep values:
+    python run_demo_pipeline.py --sweep --sweep-values 50 100 150 200 300 400 500
+
+    # Custom M and epochs for main run:
+    python run_demo_pipeline.py --n-inducing 400 --epochs 150 --sweep
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+import time
+import os
+import subprocess
+from pathlib import Path
+from datetime import datetime
+import json
+
+import numpy as np
+import pandas as pd
+import torch
+from tqdm import tqdm
+
+# Use non-interactive backend for scripts
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+try:
+    import folium
+    from branca.colormap import linear as _linear_colormap  # noqa: F401
+except Exception:
+    folium = None
+    _linear_colormap = None
+
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(PROJECT_ROOT))
+
+from experiments.reproduce_paper_daily import build_daily_dataset_from_sources
+from src.data import DataLoader, DataPreprocessor
+from src.models import FusionSVGP, GridPriorMean
+from src.training import Trainer, EarlyStopping, ModelCheckpoint
+from src.inference import Predictor
+from src.evaluation import Evaluator, rmse, mse, mae, bias
+from src.evaluation.metrics import mape
+from src.visualization import (
+    plot_training_history,
+    plot_predictions,
+    plot_uncertainty,
+    plot_calibration,
+    plot_residuals,
+)
+
+
+def export_uq_dataset(
+    data,
+    output_path: Path,
+    scalers,
+    covariate_columns=None,
+    lur_source_column: str = "predicted_no2",
+    data_path_for_lur: Path | None = None,
+    add_lur_as_source: bool = False,
+):
+    """
+    Export FusionData into a long-form CSV for external UQ.
+
+    Columns: latitude, longitude, timestamp, value, source, grid_id, [covariates...], [lur_no2]
+    Optionally appends LUR rows as a separate source.
+    """
+    # UQ export: keep long-form rows so downstream pipelines can filter by source.
+    rows = []
+    covariate_columns = covariate_columns or []
+
+    for source, mask in data.source_masks.items():
+        if mask.sum() == 0:
+            continue
+
+        vals = data.observations[source].copy()
+        if scalers is not None and getattr(scalers, "normalize_targets", False) and source in scalers.target_std:
+            vals = vals * scalers.target_std[source] + scalers.target_mean[source]
+
+        coords = data.coords[mask]
+        timestamps = data.timestamps[mask]
+        grid_ids = data.grid_ids[mask] if data.grid_ids is not None else [float("nan")] * len(timestamps)
+
+        df = pd.DataFrame({
+            "latitude": coords[:, 0],
+            "longitude": coords[:, 1],
+            "timestamp": timestamps,
+            "grid_id": grid_ids,
+            "value": vals[mask],
+            "source": source,
+        })
+
+        if getattr(data, "covariates", None) is not None and len(covariate_columns) == data.covariates.shape[1]:
+            cov = data.covariates[mask]
+            for i, col in enumerate(covariate_columns):
+                df[col] = cov[:, i]
+
+        rows.append(df)
+
+    if not rows:
+        return
+
+    out = pd.concat(rows, ignore_index=True)
+
+    if data_path_for_lur is not None and "grid_id" in out.columns:
+        try:
+            df_lur = pd.read_csv(data_path_for_lur, usecols=["grid_id", lur_source_column])
+            df_lur = df_lur.dropna(subset=["grid_id"]).drop_duplicates("grid_id")
+            out = out.merge(
+                df_lur.rename(columns={lur_source_column: "lur_no2"}),
+                on="grid_id",
+                how="left",
+            )
+        except Exception:
+            out["lur_no2"] = float("nan")
+
+        if add_lur_as_source and "lur_no2" in out.columns:
+            lur_rows = out[out["lur_no2"].notna()].copy()
+            lur_rows["value"] = lur_rows["lur_no2"]
+            lur_rows["source"] = "lur"
+            out = pd.concat([out, lur_rows], ignore_index=True)
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    out.to_csv(output_path, index=False)
+
+
+def compute_upwind_traffic(
+    df: pd.DataFrame,
+    traffic: np.ndarray,
+    n_sectors: int = 8,
+    max_dist_km: float = 3.0,
+    decay_power: float = 2.0,
+    lat_col: str = "latitude",
+    lon_col: str = "longitude",
+) -> np.ndarray:
+    """
+    For each grid cell and each wind sector i, compute the IDW-weighted sum of
+    traffic volumes from cells that lie upwind (in the direction FROM which
+    sector i wind blows).
+
+    Wind sector i = wind arriving FROM direction i * (360/n_sectors) degrees
+    clockwise from North.  Upwind cells for sector i are those located in that
+    direction from the target cell, within max_dist_km.
+
+    Returns array of shape (n_rows, n_sectors).
+    """
+    # Deduplicate to unique grid cells for efficient O(n_cells²) computation
+    coords_df = df[[lat_col, lon_col]].copy()
+    unique_coords = coords_df.drop_duplicates().reset_index(drop=True)
+    n_unique = len(unique_coords)
+
+    unique_keys = list(zip(unique_coords[lat_col], unique_coords[lon_col]))
+    key_to_idx = {k: i for i, k in enumerate(unique_keys)}
+    row_to_cell = np.array([
+        key_to_idx[(lat, lon)]
+        for lat, lon in zip(df[lat_col], df[lon_col])
+    ])
+
+    # Assign traffic value to each unique cell (take mean across rows — should
+    # be constant since traffic is a static grid attribute)
+    cell_traffic = np.zeros(n_unique)
+    for row_i, cell_i in enumerate(row_to_cell):
+        cell_traffic[cell_i] = traffic[row_i]
+
+    # Local Cartesian coordinates (km), centred on domain mean
+    lat_arr = unique_coords[lat_col].to_numpy()
+    lon_arr = unique_coords[lon_col].to_numpy()
+    lat_mean = lat_arr.mean()
+    km_per_deg_lat = 111.0
+    km_per_deg_lon = 111.0 * np.cos(np.radians(lat_mean))
+
+    y = (lat_arr - lat_mean) * km_per_deg_lat   # North (km)
+    x = (lon_arr - lon_arr.mean()) * km_per_deg_lon  # East (km)
+
+    # Pairwise displacement: dx[i,j] = x[j]-x[i]  (vector from cell i to j)
+    dx = x[None, :] - x[:, None]   # (n_unique, n_unique)
+    dy = y[None, :] - y[:, None]
+    dist_km = np.sqrt(dx ** 2 + dy ** 2)
+
+    # Bearing of vector i→j: degrees clockwise from North
+    bearing = np.degrees(np.arctan2(dx, dy)) % 360  # atan2(East, North)
+    del dx, dy   # free pairwise displacement arrays (~56 MB) before sector loop
+
+    sector_size = 360.0 / n_sectors
+    half_width = sector_size / 2.0
+
+    cell_upwind = np.zeros((n_unique, n_sectors))
+    for s in range(n_sectors):
+        center = s * sector_size
+        ang_diff = (bearing - center + 180) % 360 - 180   # in [-180, 180]
+        in_sector = np.abs(ang_diff) <= half_width
+        in_range = (dist_km > 1e-9) & (dist_km <= max_dist_km)
+        valid = in_sector & in_range
+        weights = np.where(valid, 1.0 / np.maximum(dist_km, 1e-9) ** decay_power, 0.0)
+        cell_upwind[:, s] = (weights * cell_traffic[None, :]).sum(axis=1)
+
+    del dist_km, bearing   # free pairwise matrices before returning
+    tqdm.write(
+        f"Upwind traffic: {n_unique} unique cells, "
+        f"max_dist={max_dist_km} km, sectors={n_sectors}"
+    )
+    return cell_upwind[row_to_cell]   # (n_rows, n_sectors)
+
+
+def add_wind_weighted_covariates(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Create wind-frequency weighted covariates.
+
+    For each wind sector i the feature captures how much traffic-generated
+    pollution is expected to arrive at each cell:
+
+        traffic_wind_i  = upwind_traffic_i × local_wind_freq_i
+        wind_speed_w_i  = local_wind_speed_i × local_wind_freq_i
+
+    upwind_traffic_i is the IDW-weighted sum of traffic counter readings from
+    cells upwind (in sector i direction) within max_dist_km.  Cells without
+    counters (traffic_volume == 0) contribute nothing to the upwind sum —
+    only verified counter readings are used.
+
+    Required columns:
+      wind_sector_0_freq ... wind_sector_7_freq
+      wind_sector_0_mean_speed ... wind_sector_7_mean_speed
+      traffic_volume
+    """
+    wind_freq_cols = [f"wind_sector_{i}_freq" for i in range(8)]
+    wind_speed_cols = [f"wind_sector_{i}_mean_speed" for i in range(8)]
+    required = wind_freq_cols + wind_speed_cols + ["traffic_volume"]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        raise ValueError(f"Missing required columns for wind-weighted features: {missing}")
+
+    freq = df[wind_freq_cols].fillna(0.0).to_numpy()
+    speed = df[wind_speed_cols].fillna(0.0).to_numpy()
+
+    # Counter cells have real values; counter-free cells get a small floor
+    # so they don't produce exact zeros but contribute negligibly to upwind sums
+    traffic = df["traffic_volume"].fillna(0.0).to_numpy(dtype=float)
+    traffic = np.where(traffic == 0.0, 1.0, traffic)
+
+    # Aggregate upwind counter traffic for each sector (wind transport)
+    upwind = compute_upwind_traffic(df, traffic)
+
+    # Step 3: weight by local wind frequency
+    for i in range(8):
+        df[f"traffic_wind_{i}"] = upwind[:, i] * freq[:, i]
+        df[f"wind_speed_w_{i}"] = speed[:, i] * freq[:, i]
+
+    covariate_columns = (
+        [f"traffic_wind_{i}" for i in range(8)] +
+        [f"wind_speed_w_{i}" for i in range(8)]
+    )
+    return df, covariate_columns
+
+
+def save_map_csv(path: Path, coords: np.ndarray, values: np.ndarray, timestamps=None, grid_ids=None) -> None:
+    """
+    Save map data for external plotting.
+    """
+    out = pd.DataFrame(
+        {
+            "latitude": coords[:, 0],
+            "longitude": coords[:, 1],
+            "value": values,
+        }
+    )
+    if grid_ids is not None:
+        out.insert(0, "grid_id", grid_ids)
+    if timestamps is not None:
+        out["timestamp"] = timestamps
+    out.to_csv(path, index=False)
+
+
+def save_leaflet_map(
+    path: Path,
+    coords: np.ndarray,
+    values: np.ndarray,
+    title: str,
+    max_points: int = 30000,
+) -> None:
+    """
+    Save an interactive Leaflet map (HTML) with colored circle markers.
+    """
+    if folium is None or _linear_colormap is None:
+        return
+
+    if len(coords) == 0:
+        return
+
+    # Downsample for performance
+    if len(coords) > max_points:
+        idx = np.random.default_rng(42).choice(len(coords), size=max_points, replace=False)
+        coords = coords[idx]
+        values = values[idx]
+
+    center = [float(np.nanmean(coords[:, 0])), float(np.nanmean(coords[:, 1]))]
+    m = folium.Map(location=center, zoom_start=11, tiles="cartodbpositron")
+
+    finite = values[np.isfinite(values)]
+    if len(finite) == 0:
+        return  # nothing to plot
+    vmin = float(finite.min())
+    vmax = float(finite.max())
+    if vmax <= vmin:
+        vmax = vmin + 1.0
+    cmap = _linear_colormap.viridis.scale(vmin, vmax)
+    cmap.caption = title
+    cmap.add_to(m)
+
+    for (lat, lon), val in zip(coords, values):
+        if not np.isfinite(val):
+            continue
+        color = cmap(val)
+        folium.CircleMarker(
+            location=[float(lat), float(lon)],
+            radius=2,
+            color=color,
+            fill=True,
+            fill_opacity=0.7,
+            opacity=0.7,
+            weight=0,
+        ).add_to(m)
+
+    m.save(path)
+
+
+DEFAULT_SWEEP_VALUES = [50, 100, 150, 200, 300, 400, 500]
+
+
+def _run_rq2_sweep(sweep_values: list[int], base_run_tag: str, data_dir: Path) -> None:
+    """
+    Run FusionGP at each M in sweep_values, collect metrics, and produce
+    RQ2 trade-off table + plots.  Called automatically after the main pipeline
+    when --sweep is passed.
+    """
+    base_tag = base_run_tag
+    sweep_dir = PROJECT_ROOT / "outputs" / f"sweep_{base_tag}"
+    sweep_dir.mkdir(parents=True, exist_ok=True)
+    sweep_rows = []
+
+    tqdm.write(f"\n{'='*60}")
+    tqdm.write(f"RQ2 INDUCING-POINT SWEEP  M = {sweep_values}")
+    tqdm.write(f"Results → {sweep_dir}")
+    tqdm.write(f"{'='*60}\n")
+
+    for n in tqdm(sweep_values, desc="Sweep n_inducing", unit="model"):
+        env = os.environ.copy()
+        env["RUN_TAG"] = f"{base_tag}_n{n}"
+        subprocess.run(
+            [sys.executable, __file__,
+             "--data-dir", str(data_dir),
+             "--n-inducing", str(n),
+             "--_subprocess"],          # prevents recursive sweep
+            env=env, check=True,
+        )
+        run_subdir = PROJECT_ROOT / "outputs" / f"demo_run_{env['RUN_TAG']}"
+        metrics_path = run_subdir / "metrics.json"
+        if metrics_path.exists():
+            metrics = json.loads(metrics_path.read_text())
+            metrics["n_inducing"] = n
+            gpkf_metrics_path = run_subdir / "metrics_gpkf.json"
+            if gpkf_metrics_path.exists():
+                gpkf_m = json.loads(gpkf_metrics_path.read_text())
+                for k, v in gpkf_m.items():
+                    metrics[f"gpkf_{k}"] = v
+            sweep_rows.append(metrics)
+
+    if not sweep_rows:
+        tqdm.write("Sweep produced no results.")
+        return
+
+    sweep_df = pd.DataFrame(sweep_rows)
+    sweep_df.to_csv(sweep_dir / "sweep_n_inducing_summary.csv", index=False)
+
+    try:
+        # ---- RQ2 Sweep Table ------------------------------------------------
+        prob_cols = ["nll", "crps"]
+        if "gpkf_crps" in sweep_df.columns:
+            prob_cols += ["gpkf_crps", "gpkf_nll"]
+        display_cols = (
+            ["n_inducing", "train_minutes", "rmse", "mae", "bias"]
+            + [c for c in prob_cols if c in sweep_df.columns]
+        )
+        table_df = sweep_df[display_cols].copy()
+        table_df.columns = (
+            ["M", "Time (min)", "RMSE", "MAE", "Bias"]
+            + [c.upper() for c in [c for c in prob_cols if c in sweep_df.columns]]
+        )
+        table_df.to_csv(sweep_dir / "rq2_sweep_table.csv", index=False)
+        md = "| " + " | ".join(table_df.columns) + " |\n"
+        md += "| " + " | ".join(["---"] * len(table_df.columns)) + " |\n"
+        for _, row in table_df.iterrows():
+            md += "| " + " | ".join(
+                f"{v:.3f}" if isinstance(v, float) else str(v) for v in row
+            ) + " |\n"
+        (sweep_dir / "rq2_sweep_table.md").write_text(md)
+
+        # ---- Knee-point detection -------------------------------------------
+        # When RMSE is flat (sparse VI is robust to M), the meaningful trade-off
+        # is runtime: find the M where runtime starts growing faster than accuracy
+        # improves.  Use the efficiency ratio = RMSE_improvement / runtime_cost.
+        rmse_arr = sweep_df["rmse"].to_numpy()
+        n_arr    = sweep_df["n_inducing"].to_numpy()
+        rt_arr   = sweep_df["train_minutes"].to_numpy() if "train_minutes" in sweep_df.columns else None
+        rmse_range = rmse_arr.max() - rmse_arr.min()
+        rmse_is_flat = rmse_range < 0.5  # µg/m³ — essentially no improvement with M
+        if len(n_arr) >= 3 and rt_arr is not None and rmse_is_flat:
+            # RMSE flat: knee = last M before runtime growth accelerates (2nd derivative)
+            rt_acc = np.diff(np.diff(rt_arr))   # second difference of runtime
+            knee_idx = int(np.argmax(rt_acc)) + 1  # M just before runtime accelerates
+            knee_M   = int(n_arr[min(knee_idx, len(n_arr) - 1)])
+        elif len(n_arr) >= 3:
+            # RMSE varies: efficiency = |ΔRMSE per ΔM| — pick point of best efficiency
+            gains    = np.abs(np.diff(rmse_arr)) / np.diff(n_arr)
+            knee_idx = int(np.argmax(gains)) + 1
+            knee_M   = int(n_arr[knee_idx])
+        else:
+            knee_idx, knee_M = len(n_arr) - 1, int(n_arr[-1])
+
+        # ---- Plot 1: RMSE + runtime vs M (dual axis) ------------------------
+        fig, ax1 = plt.subplots(figsize=(7, 4))
+        color_rmse, color_rt = "steelblue", "darkorange"
+        ax1.plot(n_arr, rmse_arr, marker="o", color=color_rmse, label="RMSE (µg/m³)")
+        ax1.set_xlabel("Number of inducing points (M)")
+        ax1.set_ylabel("RMSE (µg/m³)", color=color_rmse)
+        ax1.tick_params(axis="y", labelcolor=color_rmse)
+        ax2_twin = ax1.twinx()
+        ax2_twin.plot(n_arr, sweep_df["train_minutes"].to_numpy(),
+                      marker="s", linestyle="--", color=color_rt, label="Runtime (min)")
+        ax2_twin.set_ylabel("Training time (minutes)", color=color_rt)
+        ax2_twin.tick_params(axis="y", labelcolor=color_rt)
+        ax1.axvline(knee_M, color="red", linestyle=":", alpha=0.7,
+                    label=f"Knee M={knee_M}")
+        ax1.annotate(f"Knee\nM={knee_M}", xy=(knee_M, rmse_arr[knee_idx]),
+                     xytext=(knee_M + max(n_arr) * 0.05, rmse_arr[knee_idx]),
+                     color="red", fontsize=8)
+        lines1, labels1 = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2_twin.get_legend_handles_labels()
+        ax1.legend(lines1 + lines2, labels1 + labels2, fontsize=8, loc="upper right")
+        ax1.set_title("RQ2: Accuracy vs Computational Cost")
+        ax1.grid(True, alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(sweep_dir / "rq2_tradeoff_rmse_runtime.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        # ---- Plot 2: GPKF CRPS + coverage_90 vs M --------------------------
+        if "gpkf_crps" in sweep_df.columns:
+            cov_col = next(
+                (c for c in sweep_df.columns if "gpkf_coverage" in c and "0.9" in c), None
+            )
+            fig, axes = plt.subplots(1, 2, figsize=(11, 4))
+            axes[0].plot(n_arr, sweep_df["gpkf_crps"].to_numpy(),
+                         marker="s", color="steelblue")
+            axes[0].axvline(knee_M, color="red", linestyle=":", alpha=0.7)
+            axes[0].set_xlabel("M (inducing points)")
+            axes[0].set_ylabel("GPKF CRPS (lower = better)")
+            axes[0].set_title("RQ2: Probabilistic Accuracy vs M")
+            axes[0].grid(True, alpha=0.3)
+            if cov_col:
+                axes[1].plot(n_arr, sweep_df[cov_col].to_numpy(),
+                             marker="s", color="green", label="GPKF coverage")
+                axes[1].axhline(0.9, color="red", linestyle="--", label="Ideal 90%")
+                axes[1].axvline(knee_M, color="gray", linestyle=":", alpha=0.7)
+                axes[1].set_xlabel("M (inducing points)")
+                axes[1].set_ylabel("Empirical 90% coverage")
+                axes[1].set_title("RQ2: Predictive Distribution Integrity vs M")
+                axes[1].legend(fontsize=8)
+                axes[1].grid(True, alpha=0.3)
+            fig.tight_layout()
+            fig.savefig(sweep_dir / "rq2_calibration_vs_M.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+
+        # ---- Interpretation text --------------------------------------------
+        rmse_pct = 100.0 * rmse_range / rmse_arr.mean() if rmse_arr.mean() > 0 else 0.0
+        rt_min = rt_arr.min() if rt_arr is not None else float("nan")
+        rt_max = rt_arr.max() if rt_arr is not None else float("nan")
+        rq2_lines = [
+            "RQ2 SWEEP INTERPRETATION",
+            "=" * 60,
+            f"Sweep range:      M = {n_arr.min():.0f} → {n_arr.max():.0f}",
+            f"RMSE range:       {rmse_arr.min():.4f} – {rmse_arr.max():.4f} µg/m³"
+            f"  (Δ={rmse_range:.4f}, {rmse_pct:.1f}% variation)",
+            f"Runtime range:    {rt_min:.1f} – {rt_max:.1f} min",
+            f"Recommended M:    {knee_M}",
+            "",
+        ]
+        if rmse_is_flat:
+            rq2_lines += [
+                "Finding: RMSE is FLAT across all M values (variation < 0.5 µg/m³).",
+                "This demonstrates that sparse variational inference is robust to the",
+                "inducing-point budget — predictive accuracy does not depend strongly on M.",
+                f"M={knee_M} is recommended: it achieves near-minimum RMSE at lower",
+                "runtime than larger M values, where training cost grows as O(NM²).",
+            ]
+        else:
+            rq2_lines += [
+                f"Knee point M={knee_M}: largest accuracy gain per inducing point.",
+                "Beyond this, increasing M yields diminishing accuracy returns.",
+            ]
+        rq2_report = "\n".join(rq2_lines)
+        tqdm.write(rq2_report)
+        (sweep_dir / "rq2_interpretation.txt").write_text(rq2_report)
+        tqdm.write(f"\nRQ2 sweep outputs saved to {sweep_dir}")
+
+    except Exception as e:
+        import traceback
+        tqdm.write(f"Sweep report generation failed: {e}\n{traceback.format_exc()}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FusionGP end-to-end pipeline")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=PROJECT_ROOT / "data",
+        help="Path to data directory (default: <repo_root>/data)",
+    )
+    parser.add_argument(
+        "--n-inducing", type=int, default=None,
+        help="Number of inducing points (overrides N_INDUCING env var, default 300)",
+    )
+    parser.add_argument(
+        "--epochs", type=int, default=None,
+        help="Number of training epochs (overrides default 200)",
+    )
+    parser.add_argument(
+        "--sweep", action="store_true",
+        help="After the main run, sweep n_inducing for RQ2 trade-off analysis",
+    )
+    parser.add_argument(
+        "--sweep-values", type=int, nargs="+", default=DEFAULT_SWEEP_VALUES,
+        metavar="M",
+        help=f"Inducing-point values for the sweep (default: {DEFAULT_SWEEP_VALUES})",
+    )
+    # Internal flag used by subprocesses so they don't trigger another sweep
+    parser.add_argument("--_subprocess", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument(
+        "--data-only", action="store_true",
+        help="Build merged dataset and export UQ CSVs only; skip training and prediction",
+    )
+    args = parser.parse_args()
+
+    data_dir = args.data_dir
+    if not data_dir.exists():
+        raise FileNotFoundError(f"Data directory not found: {data_dir}")
+
+    # Preflight: check all required files exist before spending any time training
+    _required_files = [
+        "satellite_retreavals.csv",
+        "epa_timeseries.csv",
+        "traffic_timeseries.csv",
+        "lur_predictions.csv",
+        "grids_coordinates.csv",
+    ]
+    _missing = [f for f in _required_files if not (data_dir / f).exists()]
+    if _missing:
+        raise FileNotFoundError(
+            f"Missing required data files in {data_dir}:\n" +
+            "\n".join(f"  - {f}" for f in _missing)
+        )
+
+    # Allow env var overrides for subprocess compatibility (sweep spawns subprocesses)
+    if args.n_inducing is not None:
+        os.environ["N_INDUCING"] = str(args.n_inducing)
+    if args.epochs is not None:
+        os.environ["N_EPOCHS"] = str(args.epochs)
+
+    pipeline_start = time.time()
+    np.random.seed(42)
+    torch.manual_seed(42)
+
+    run_tag = os.getenv("RUN_TAG") or datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_dir = PROJECT_ROOT / "outputs" / f"demo_run_{run_tag}"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    fig_dir = run_dir / "figures"
+    fig_dir.mkdir(parents=True, exist_ok=True)
+
+    pbar = tqdm(total=15, desc="Pipeline", unit="step")
+    try:
+        # Build merged daily dataset (aggregates hourly traffic/satellite to daily)
+        merged_path = build_daily_dataset_from_sources(data_dir)
+        import gc; gc.collect()   # release large intermediate frames from build step
+        pbar.update(1)
+
+        # Preview merged data
+        df = pd.read_csv(merged_path)
+        tqdm.write(f"Merged data: {df.shape}")
+        tqdm.write(str(df.head(5)))
+        pbar.update(1)
+
+        # Covariates: wind-frequency weighted traffic and wind speed (Option B)
+        # Re-use the derived CSV if it already exists to avoid recomputing the
+        # (n_cells × n_cells) upwind traffic matrix on every run.
+        derived_path = run_dir / "merged_with_wind_weighted.csv"
+        if derived_path.exists():
+            tqdm.write(f"Re-using existing wind-weighted CSV: {derived_path}")
+            df = pd.read_csv(derived_path)
+            # Reconstruct covariate_columns from column names
+            covariate_columns = (
+                [f"traffic_wind_{i}" for i in range(8)] +
+                [f"wind_speed_w_{i}" for i in range(8)]
+            )
+        else:
+            df, covariate_columns = add_wind_weighted_covariates(df)
+            df.to_csv(derived_path, index=False)
+        gc.collect()   # release any remaining large arrays before training
+        merged_path = derived_path
+
+        # Load merged dataset
+        loader = DataLoader(
+            merged_path,
+            column_mapping={
+                "grid_id": "grid_id",
+                "latitude": "latitude",
+                "longitude": "longitude",
+                "timestamp": "timestamp",
+                "satellite": "satellite_no2",
+                "epa": "epa_no2",
+            },
+            covariate_columns=covariate_columns,
+        )
+        data = loader.load()
+        tqdm.write(data.summary())
+        pbar.update(1)
+
+        # Preprocess and split: normalize inputs + targets per source.
+        # normalize_targets=True standardizes each source to ~N(0,1) during
+        # training. The Predictor uses scalers to inverse-transform back to
+        # original µg/m³ scale for evaluation and plotting.
+        preprocessor = DataPreprocessor(
+            normalize_coords=True,
+            normalize_time=True,
+            normalize_targets=True,
+        )
+        train_data, val_data, test_data = preprocessor.fit_transform(
+            data,
+            train_ratio=0.7,
+            val_ratio=0.15,
+            test_ratio=0.15,
+            split_strategy="random",
+            random_seed=42,
+        )
+        tqdm.write(f"Train: {train_data.n_observations:,}")
+        tqdm.write(f"Val:   {val_data.n_observations:,}")
+        tqdm.write(f"Test:  {test_data.n_observations:,}")
+        pbar.update(1)
+
+        # Use a small fraction of EPA in training to anchor the latent field.
+        def _drop_source(split_data, source_name: str):
+            if source_name not in split_data.observations:
+                return split_data
+            obs = split_data.observations[source_name].copy()
+            obs[:] = np.nan
+            split_data.observations[source_name] = obs
+            split_data.source_masks[source_name] = ~np.isnan(obs)
+            return split_data
+
+        # Keep a fraction of EPA in train; remove EPA from val.
+        epa_keep_frac = float(os.getenv("EPA_TRAIN_FRACTION", "0.2"))
+        if "epa" in train_data.observations:
+            epa_obs = train_data.observations["epa"].copy()
+            epa_mask = train_data.source_masks["epa"].copy()
+            idx = np.where(epa_mask)[0]
+            if len(idx) > 0:
+                rng = np.random.default_rng(42)
+                n_keep = max(1, int(len(idx) * epa_keep_frac))
+                keep_idx = rng.choice(idx, size=n_keep, replace=False)
+                drop_idx = np.setdiff1d(idx, keep_idx)
+                epa_obs[drop_idx] = np.nan
+                train_data.observations["epa"] = epa_obs
+                train_data.source_masks["epa"] = ~np.isnan(epa_obs)
+        val_data = _drop_source(val_data, "epa")
+
+        # Export UQ-ready datasets (train/val/test) for downstream UQ.
+        # This keeps EPA/SAT observations and optionally adds LUR as a pseudo-source.
+        uq_dir = run_dir / "uq"
+        uq_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            export_uq_dataset(
+                train_data,
+                uq_dir / "uq_train.csv",
+                preprocessor.get_scalers(),
+                covariate_columns=covariate_columns,
+                data_path_for_lur=merged_path,
+                add_lur_as_source=True,
+            )
+            export_uq_dataset(
+                val_data,
+                uq_dir / "uq_val.csv",
+                preprocessor.get_scalers(),
+                covariate_columns=covariate_columns,
+                data_path_for_lur=merged_path,
+                add_lur_as_source=True,
+            )
+            export_uq_dataset(
+                test_data,
+                uq_dir / "uq_test.csv",
+                preprocessor.get_scalers(),
+                covariate_columns=covariate_columns,
+                data_path_for_lur=merged_path,
+                add_lur_as_source=True,
+            )
+            tqdm.write(f"Saved UQ exports to: {uq_dir}")
+        except Exception as e:
+            tqdm.write(f"UQ export failed: {e}")
+        pbar.update(1)
+
+        if args.data_only:
+            tqdm.write("\n--data-only: UQ datasets exported. Skipping training and prediction.")
+            return
+
+        # Build LUR prior mean from merged CSV (static per-grid background)
+        grid_df = (
+            df[["grid_id", "latitude", "longitude", "predicted_no2"]]
+            .drop_duplicates("grid_id")
+            .dropna(subset=["latitude", "longitude", "predicted_no2"])
+        )
+        grid_coords = grid_df[["latitude", "longitude"]].values
+        grid_values = grid_df["predicted_no2"].values
+        grid_ids = grid_df["grid_id"].values
+
+        prior_mean = GridPriorMean(
+            grid_coords=grid_coords,
+            grid_values=grid_values,
+            scalers=preprocessor.scalers,
+            learnable_bias=True,
+        )
+        pbar.update(1)
+
+        # Model: spatio-temporal GP with LUR prior and covariates
+        fast_run = os.getenv("FAST_RUN", "0") == "1"
+        n_inducing = 100 if fast_run else int(os.getenv("N_INDUCING", "300"))
+        n_epochs   = 2   if fast_run else int(os.getenv("N_EPOCHS",   "200"))
+        batch_size = 128 if fast_run else int(os.getenv("BATCH_SIZE", "256"))
+
+        model = FusionSVGP(
+            learn_calibration=True,
+            n_inducing=n_inducing,
+            spatial_kernel_type="matern32",
+            temporal_kernel_type="exponential",  # Exponential for rapid temporal decay
+            spatial_ard=True,
+            learn_inducing_locations=True,
+            sources=["epa", "satellite"],
+            initial_noise={"epa": 0.5, "satellite": 3.0},
+            initial_lengthscales={"spatial_x": 0.4, "spatial_y": 0.4, "temporal": 0.3},
+            n_covariates=len(covariate_columns),
+            prior_mean=prior_mean,
+        )
+        tqdm.write(str(model))
+        pbar.update(1)
+
+        # Trainer with early stopping + checkpointing
+        early_stopping = EarlyStopping(
+            monitor="val_loss",
+            patience=50,
+            min_delta=1e-4,
+            restore_best_weights=True,
+        )
+        checkpoint = ModelCheckpoint(
+            save_dir=str(run_dir / "checkpoints"),
+            monitor="val_loss",
+            save_best_only=True,
+        )
+        val_interval = 1 if fast_run else 5
+        trainer = Trainer(
+            model,
+            learning_rate=0.005,
+            n_epochs=n_epochs,
+            batch_size=batch_size,
+            gradient_clip=1.0,
+            val_interval=val_interval,
+            callbacks=[early_stopping, checkpoint],
+            device="cpu",
+        )
+
+        # Train (time the training step)
+        train_start = time.time()
+        history = trainer.fit(train_data, val_data, verbose=True)
+        train_seconds = time.time() - train_start
+        tqdm.write(f"Training time: {train_seconds/60:.2f} minutes")
+        pbar.update(1)
+
+        # Plot training history
+        history_dict = history.to_dict()
+        if history_dict.get("val_loss"):
+            fig = plot_training_history(history_dict)
+            fig.savefig(fig_dir / "training_history.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+        else:
+            tqdm.write("Skipping training history plot (no val_loss recorded).")
+
+        # Predict on test split
+        predictor = Predictor(
+            model,
+            scalers=preprocessor.get_scalers(),
+            batch_size=1024,
+            confidence_levels=[0.5, 0.9, 0.95],
+        )
+        predictions = predictor.predict(test_data, verbose=True)
+        tqdm.write(predictions.summary())
+        pbar.update(1)
+
+        # Evaluate against EPA (reference source)
+        # When normalize_targets=True, test observations are in normalized space.
+        # Inverse-transform both y_true and predictions to original µg/m³ scale.
+        scalers = preprocessor.get_scalers()
+        test_mask = test_data.source_masks["epa"]
+        y_true = test_data.observations["epa"][test_mask]
+        if getattr(scalers, "normalize_targets", False) and "epa" in scalers.target_std:
+            y_true = y_true * scalers.target_std["epa"] + scalers.target_mean["epa"]
+        y_pred_mean = predictions.mean[test_mask]
+        y_pred_std = predictions.std[test_mask]
+
+        evaluator = Evaluator(confidence_levels=[0.5, 0.8, 0.9, 0.95])
+        metrics = evaluator.evaluate(y_true, y_pred_mean, y_pred_std)
+        tqdm.write(metrics.summary())
+        tqdm.write("\nAll metrics:")
+        for name, value in metrics.to_dict().items():
+            tqdm.write(f"  {name}: {value:.4f}")
+        pbar.update(1)
+
+        # Save predictions + EPA truth for downstream uncertainty analysis
+        pred_df = predictions.to_dataframe()
+        pred_df["is_epa"] = test_mask
+        pred_df["epa_true"] = np.nan
+        pred_df.loc[test_mask, "epa_true"] = y_true
+        pred_path = run_dir / "predictions.csv"
+        pred_df.to_csv(pred_path, index=False)
+        tqdm.write(f"Predictions saved to {pred_path}")
+
+        # Save metrics summary
+        metrics_dict = metrics.to_dict()
+        # Ensure JSON-serializable scalars
+        metrics_json = {k: float(v) for k, v in metrics_dict.items()}
+        metrics_json["train_minutes"] = train_seconds / 60.0
+        metrics_path = run_dir / "metrics.json"
+        metrics_path.write_text(json.dumps(metrics_json, indent=2))
+        pd.DataFrame([metrics_dict]).to_csv(run_dir / "metrics.csv", index=False)
+        tqdm.write(f"Metrics saved to {metrics_path}")
+        pbar.update(1)
+
+        unique_days = np.unique(data.timestamps)
+
+        # Kalman smoother — day-by-day spatio-temporal tracking
+        try:
+            from src.inference.kalman_smoother import KalmanSmoother
+            tqdm.write("\nRunning Kalman smoother for day-by-day tracking...")
+            smoother = KalmanSmoother(
+                model=model,
+                predictor=predictor,
+                scalers=preprocessor.get_scalers(),
+                run_backward_smoother=True,
+                batch_size=1024,
+            )
+            smoothed = smoother.smooth(
+                coords_original=grid_coords,
+                unique_days=unique_days,
+            )
+            kalman_dir = run_dir / "kalman_maps"
+            kalman_dir.mkdir(parents=True, exist_ok=True)
+            for d_idx, day_val in enumerate(unique_days):
+                pd.DataFrame({
+                    "latitude": smoothed.coords[:, 0],
+                    "longitude": smoothed.coords[:, 1],
+                    "mean_ug_m3": smoothed.mean_ug[:, d_idx],
+                    "std_ug_m3": smoothed.std_ug[:, d_idx],
+                    "svgp_mean_ug_m3": smoothed.svgp_mean_ug[:, d_idx],
+                    "svgp_std_ug_m3": smoothed.svgp_std_ug[:, d_idx],
+                    "day": day_val,
+                }).to_csv(kalman_dir / f"kalman_day_{d_idx:02d}.csv", index=False)
+            tqdm.write(f"Kalman maps saved to {kalman_dir}  ({len(unique_days)} days)")
+        except Exception as e:
+            tqdm.write(f"Kalman smoother failed: {e}")
+        pbar.update(1)
+
+        # GP-Kalman Filter — proper sequential fusion (LUR prior + daily obs updates)
+        gpkf_seq_preds = None
+        gpkf_epa_test_days_raw = None
+        gpkf_unique_days = None
+        try:
+            from src.inference.gp_kalman_filter import GPKalmanFilter
+            tqdm.write("\nRunning GP-Kalman Filter (sequential fusion from LUR prior)...")
+            _scalers = preprocessor.get_scalers()
+
+            # Convert covariate_df timestamps to numeric (days since first observation)
+            # to match the scale used by DataLoader._convert_timestamps.
+            df_cov = df.copy()
+            _ts_dt = pd.to_datetime(df_cov["timestamp"], errors="coerce")
+            df_cov["timestamp"] = (
+                (_ts_dt - _ts_dt.min()).dt.total_seconds() / 86400.0
+            )
+
+            gpkf = GPKalmanFilter(
+                model, _scalers,
+                covariate_df=df_cov,
+                covariate_cols=covariate_columns,
+                train_data=train_data,
+            )
+            del df_cov  # free the copy after the cache is built inside GPKalmanFilter.__init__
+
+            # Build the non-test dataset for the GPKF.
+            # The GPKF gets all train + val observations (EPA + satellite) — only
+            # the 15% test split is withheld for evaluation.
+            #
+            # Coordinates must stay in RAW (lat/lon degrees) — the filter normalises
+            # them internally with scalers.coord_min / coord_scale.
+            # Observations must be in NORMALISED space to match the Kalman state.
+            # Using preprocessor.transform() would also normalise coords to [0,1],
+            # which would cause double-normalisation inside the filter (H ≈ 0).
+            non_test_idx = np.concatenate([
+                preprocessor.train_indices_,
+                preprocessor.val_indices_,
+            ])
+            norm_non_test = preprocessor._subset_data(data, non_test_idx)
+            # Normalise only the observations (coords and timestamps stay raw)
+            for _src in list(norm_non_test.observations.keys()):
+                if _scalers.normalize_targets and _src in _scalers.target_mean:
+                    norm_non_test.observations[_src] = (
+                        (norm_non_test.observations[_src] - _scalers.target_mean[_src])
+                        / _scalers.target_std[_src]
+                    )
+
+            # GPKF filter expects timestamps in raw day scale (0, 1, 2, ..., N_DAYS-1),
+            # NOT normalised [0, 1]. Use raw_timestamps and convert to days since first obs.
+            _raw_ts = pd.to_datetime(norm_non_test.raw_timestamps, errors="coerce")
+            _global_min_ts = pd.to_datetime(data.raw_timestamps, errors="coerce").min()
+            _raw_ts_days = (_raw_ts - _global_min_ts).total_seconds() / 86400.0
+            norm_non_test.timestamps[:] = _raw_ts_days.values
+            gpkf_unique_days = np.unique(_raw_ts_days.values)
+
+            # test_data coords and timestamps are normalised → denormalise to raw scale
+            epa_test_coords_raw = (
+                test_data.coords[test_mask] * _scalers.coord_scale + _scalers.coord_min
+            )
+            _raw_ts_test = pd.to_datetime(test_data.raw_timestamps[test_mask], errors="coerce")
+            gpkf_epa_test_days_raw = (
+                (_raw_ts_test - _global_min_ts).total_seconds() / 86400.0
+            )
+
+            gpkf_seq_preds = gpkf.filter(
+                norm_non_test, gpkf_unique_days, grid_coords,
+                eval_coords_original=epa_test_coords_raw,
+            )
+            gpkf_dir = run_dir / "gpkf_maps"
+            gpkf_dir.mkdir(parents=True, exist_ok=True)
+            for d_idx, day_val in enumerate(gpkf_unique_days):
+                pd.DataFrame({
+                    "grid_id": grid_ids,
+                    "latitude": gpkf_seq_preds.coords[:, 0],
+                    "longitude": gpkf_seq_preds.coords[:, 1],
+                    "mean_ug_m3": gpkf_seq_preds.mean_ug[:, d_idx],
+                    "std_ug_m3": gpkf_seq_preds.std_ug[:, d_idx],
+                    "n_obs": gpkf_seq_preds.n_obs_per_day[d_idx],
+                    "day": day_val,
+                }).to_csv(gpkf_dir / f"gpkf_day_{d_idx:02d}.csv", index=False)
+            tqdm.write(
+                f"GP-Kalman maps saved to {gpkf_dir}  ({len(gpkf_unique_days)} days)\n"
+                f"  Obs per day: min={gpkf_seq_preds.n_obs_per_day.min()}, "
+                f"max={gpkf_seq_preds.n_obs_per_day.max()}, "
+                f"mean={gpkf_seq_preds.n_obs_per_day.mean():.1f}"
+            )
+        except Exception as e:
+            import traceback
+            err_msg = f"GP-Kalman filter failed: {e}\n{traceback.format_exc()}"
+            tqdm.write(err_msg)
+            try:
+                (run_dir / "gpkf_error.txt").write_text(err_msg)
+            except Exception:
+                pass
+
+        # Baseline maps (LUR + ATMO-Plan) and fusion map
+        map_dir = run_dir / "map_data"
+        map_dir.mkdir(parents=True, exist_ok=True)
+        leaflet_dir = run_dir / "leaflet_maps"
+        leaflet_dir.mkdir(parents=True, exist_ok=True)
+        fig = plot_predictions(
+            grid_coords,
+            grid_values,
+            title="LUR Baseline (predicted_no2)",
+        )
+        fig.savefig(fig_dir / "lur_baseline.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        save_map_csv(map_dir / "lur_baseline.csv", grid_coords, grid_values, grid_ids=grid_ids)
+        save_leaflet_map(
+            leaflet_dir / "lur_baseline.html",
+            grid_coords,
+            grid_values,
+            "LUR Baseline (predicted_no2)",
+        )
+
+        atmo_path = data_dir / "atmos_plan_model_no2.csv"
+        atmo_df = None
+        if atmo_path.exists():
+            atmo_df = pd.read_csv(atmo_path)
+            fig = plot_predictions(
+                atmo_df[["latitude", "longitude"]].values,
+                atmo_df["model_no2"].values,
+                title="ATMO-Plan Baseline (model_no2)",
+            )
+            fig.savefig(fig_dir / "atmo_plan_baseline.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            save_map_csv(
+                map_dir / "atmo_plan_baseline.csv",
+                atmo_df[["latitude", "longitude"]].values,
+                atmo_df["model_no2"].values,
+                grid_ids=atmo_df["grid_id"].values if "grid_id" in atmo_df.columns else None,
+            )
+            save_leaflet_map(
+                leaflet_dir / "atmo_plan_baseline.html",
+                atmo_df[["latitude", "longitude"]].values,
+                atmo_df["model_no2"].values,
+                "ATMO-Plan Baseline (model_no2)",
+            )
+        else:
+            tqdm.write(f"ATMO-Plan file not found: {atmo_path}")
+
+        fig = plot_predictions(predictions.coords, predictions.mean, title="Fusion Predictions (Test Set)")
+        fig.savefig(fig_dir / "predictions.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        save_map_csv(map_dir / "fusion_predictions.csv", predictions.coords, predictions.mean, predictions.timestamps, grid_ids=predictions.grid_ids)
+        save_leaflet_map(
+            leaflet_dir / "fusion_predictions.html",
+            predictions.coords,
+            predictions.mean,
+            "Fusion Predictions (Test Set)",
+        )
+
+        fig = plot_uncertainty(predictions.coords, predictions.std, title="Prediction Uncertainty (Std Dev)")
+        fig.savefig(fig_dir / "uncertainty.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        save_map_csv(map_dir / "fusion_uncertainty.csv", predictions.coords, predictions.std, predictions.timestamps, grid_ids=predictions.grid_ids)
+
+        fig = plot_calibration(y_true, y_pred_mean, y_pred_std, title="Calibration Diagnostic")
+        fig.savefig(fig_dir / "calibration.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+
+        fig = plot_residuals(y_true, y_pred_mean, y_pred_std, title="Residual Analysis")
+        fig.savefig(fig_dir / "residuals.png", dpi=200, bbox_inches="tight")
+        plt.close(fig)
+        pbar.update(1)
+
+        # Additional spatial maps at specific day indices (1-based within unique timestamps)
+        day_indices = [7, 14, 21, 28]
+        unique_ts = np.unique(predictions.timestamps)
+        unique_ts = np.array(sorted(unique_ts))
+        for day_idx in day_indices:
+            idx = day_idx - 1
+            if idx < 0 or idx >= len(unique_ts):
+                tqdm.write(f"Skipping day {day_idx}: only {len(unique_ts)} unique days available")
+                continue
+            ts = unique_ts[idx]
+            mask = predictions.timestamps == ts
+            fig = plot_predictions(
+                predictions.coords[mask],
+                predictions.mean[mask],
+                title=f"Fusion Predictions (Day {day_idx}: {ts})",
+            )
+            fig.savefig(fig_dir / f"predictions_day_{day_idx:02d}.png", dpi=200, bbox_inches="tight")
+            plt.close(fig)
+            save_map_csv(
+                map_dir / f"fusion_predictions_day_{day_idx:02d}.csv",
+                predictions.coords[mask],
+                predictions.mean[mask],
+                predictions.timestamps[mask],
+                grid_ids=predictions.grid_ids[mask] if predictions.grid_ids is not None else None,
+            )
+            save_leaflet_map(
+                leaflet_dir / f"fusion_predictions_day_{day_idx:02d}.html",
+                predictions.coords[mask],
+                predictions.mean[mask],
+                f"Fusion Predictions (Day {day_idx}: {ts})",
+            )
+
+        # Baseline metric comparison table (point metrics only)
+        test_grid_ids = test_data.grid_ids[test_mask]
+        lur_map = df.dropna(subset=["grid_id", "predicted_no2"]).drop_duplicates("grid_id")
+        lur_map = lur_map.set_index("grid_id")["predicted_no2"]
+        lur_pred = pd.Series(test_grid_ids).map(lur_map).to_numpy()
+
+        atmo_pred = None
+        if atmo_df is not None:
+            atmo_map = atmo_df.dropna(subset=["grid_id", "model_no2"]).drop_duplicates("grid_id")
+            atmo_map = atmo_map.set_index("grid_id")["model_no2"]
+            atmo_pred = pd.Series(test_grid_ids).map(atmo_map).to_numpy()
+
+        def point_metrics(y_true_vals, y_pred_vals):
+            mask = ~(np.isnan(y_true_vals) | np.isnan(y_pred_vals))
+            if mask.sum() == 0:
+                return {
+                    "rmse": np.nan,
+                    "mse": np.nan,
+                    "mae": np.nan,
+                    "bias": np.nan,
+                    "mape": np.nan,
+                    "corr": np.nan,
+                }
+            yt = y_true_vals[mask]
+            yp = y_pred_vals[mask]
+            corr = np.nan
+            if len(yt) > 1:
+                corr = np.corrcoef(yt, yp)[0, 1]
+            return {
+                "rmse": rmse(yt, yp),
+                "mse": mse(yt, yp),
+                "mae": mae(yt, yp),
+                "bias": bias(yt, yp),
+                "mape": mape(yt, yp),
+                "corr": corr,
+            }
+
+        metrics_fusion = point_metrics(y_true, y_pred_mean)
+        metrics_lur = point_metrics(y_true, lur_pred)
+        metrics_rows = [
+            {"model": "FusionGP", **metrics_fusion},
+            {"model": "LUR", **metrics_lur},
+        ]
+        if atmo_pred is not None:
+            metrics_atmo = point_metrics(y_true, atmo_pred)
+            metrics_rows.append({"model": "ATMO-Plan", **metrics_atmo})
+
+        # Evaluate GPKF against EPA test observations (predictions made during filter run)
+        gpkf_prob_metrics_dict = {}
+        if (gpkf_seq_preds is not None and gpkf_seq_preds.eval_mean_ug is not None
+                and gpkf_epa_test_days_raw is not None and gpkf_unique_days is not None):
+            # gpkf_epa_test_days_raw is in the same scale as unique_days (raw)
+            gpkf_pred     = np.full(len(y_true), np.nan)
+            gpkf_pred_std = np.full(len(y_true), np.nan)
+            for i, t_val in enumerate(gpkf_epa_test_days_raw):
+                day_idx = int(np.argmin(np.abs(gpkf_unique_days - t_val)))
+                gpkf_pred[i]     = gpkf_seq_preds.eval_mean_ug[i, day_idx]
+                gpkf_pred_std[i] = gpkf_seq_preds.eval_std_ug[i, day_idx]
+            metrics_gpkf = point_metrics(y_true, gpkf_pred)
+            metrics_rows.append({"model": "GPKF", **metrics_gpkf})
+            tqdm.write(
+                f"GPKF vs EPA: RMSE={metrics_gpkf['rmse']:.4f}, "
+                f"MAE={metrics_gpkf['mae']:.4f}, "
+                f"Corr={metrics_gpkf['corr']:.4f}, "
+                f"Bias={metrics_gpkf['bias']:.4f}"
+            )
+            # Probabilistic metrics for GPKF (RQ2: predictive distribution integrity)
+            valid = ~np.isnan(gpkf_pred) & ~np.isnan(gpkf_pred_std) & ~np.isnan(y_true)
+            if valid.sum() > 5:
+                gpkf_evaluator = Evaluator(confidence_levels=[0.5, 0.8, 0.9, 0.95])
+                gpkf_prob_result = gpkf_evaluator.evaluate(
+                    y_true[valid], gpkf_pred[valid], gpkf_pred_std[valid]
+                )
+                gpkf_prob_metrics_dict = gpkf_prob_result.to_dict()
+                tqdm.write("\nGPKF probabilistic metrics (RQ2 — predictive distribution integrity):")
+                for k, v in gpkf_prob_metrics_dict.items():
+                    tqdm.write(f"  {k}: {v:.4f}")
+                # Calibration plot for GPKF (RQ2)
+                try:
+                    fig_gpkf_cal = plot_calibration(
+                        y_true[valid], gpkf_pred[valid], gpkf_pred_std[valid],
+                        title="GPKF Calibration Diagnostic (RQ2)"
+                    )
+                    fig_gpkf_cal.savefig(fig_dir / "gpkf_calibration.png", dpi=200,
+                                         bbox_inches="tight")
+                    plt.close(fig_gpkf_cal)
+                    tqdm.write(f"GPKF calibration plot saved to {fig_dir / 'gpkf_calibration.png'}")
+                except Exception as _e:
+                    tqdm.write(f"GPKF calibration plot failed: {_e}")
+                # Save GPKF metrics JSON (for M-sweep aggregation)
+                gpkf_metrics_json = {k: float(v) for k, v in gpkf_prob_metrics_dict.items()}
+                gpkf_metrics_json.update({k: float(metrics_gpkf[k]) for k in metrics_gpkf})
+                gpkf_metrics_json["n_inducing"] = n_inducing
+                (run_dir / "metrics_gpkf.json").write_text(json.dumps(gpkf_metrics_json, indent=2))
+                tqdm.write(f"GPKF metrics saved to {run_dir / 'metrics_gpkf.json'}")
+
+        metrics_table = pd.DataFrame(metrics_rows)
+        # Add fusion-only probabilistic metrics (leave NaN for baselines)
+        prob_keys = [
+            "nll",
+            "crps",
+            "dss",
+            "sharpness",
+            "pit_deviation",
+            "interval_score_90",
+        ]
+        # Coverage + calibration error per level, e.g., coverage_90, calibration_error_90
+        for key in metrics_dict.keys():
+            if key.startswith("coverage_") or key.startswith("calibration_error_"):
+                prob_keys.append(key)
+
+        prob_keys = sorted(set(prob_keys))
+        for key in prob_keys:
+            metrics_table[key] = np.nan
+            if key in metrics_dict:
+                metrics_table.loc[metrics_table["model"] == "FusionGP", key] = metrics_dict[key]
+            if key in gpkf_prob_metrics_dict:
+                metrics_table.loc[metrics_table["model"] == "GPKF", key] = gpkf_prob_metrics_dict[key]
+
+        metrics_table_path = run_dir / "metrics_baselines.csv"
+        metrics_table.to_csv(metrics_table_path, index=False)
+        tqdm.write(f"Baseline comparison table saved to {metrics_table_path}")
+
+        # Final results table (CSV + Markdown) for reporting
+        final_table = metrics_table.copy()
+        final_table_path = run_dir / "final_results_table.csv"
+        final_table.to_csv(final_table_path, index=False)
+        # Write a simple Markdown table without requiring tabulate
+        final_md_path = run_dir / "final_results_table.md"
+        headers = list(final_table.columns)
+        rows = final_table.values.tolist()
+        md_lines = []
+        md_lines.append("| " + " | ".join(headers) + " |")
+        md_lines.append("| " + " | ".join(["---"] * len(headers)) + " |")
+        for row in rows:
+            md_lines.append("| " + " | ".join(str(v) for v in row) + " |")
+        final_md_path.write_text("\n".join(md_lines))
+        tqdm.write(f"Final results table saved to {final_table_path} and {final_md_path}")
+
+        def format_comparison(title, base_metrics, fused_metrics):
+            def pct_improve(base, fused):
+                if np.isnan(base) or base == 0:
+                    return "n/a"
+                return f"{(1.0 - fused / base) * 100:>6.1f}%"
+
+            lines = []
+            lines.append("=" * 70)
+            lines.append(title)
+            lines.append("=" * 70)
+            lines.append("  Metric              Base           Fused   Fused vs Base")
+            lines.append(f"  RMSE          {base_metrics['rmse']:>10.4f}  {fused_metrics['rmse']:>10.4f}   {pct_improve(base_metrics['rmse'], fused_metrics['rmse'])}")
+            lines.append(f"  MAE           {base_metrics['mae']:>10.4f}  {fused_metrics['mae']:>10.4f}   {pct_improve(base_metrics['mae'], fused_metrics['mae'])}")
+            lines.append(f"  Bias          {base_metrics['bias']:>10.4f}  {fused_metrics['bias']:>10.4f}")
+            lines.append("=" * 70)
+            return "\n".join(lines)
+
+        # GPKF metrics for comparison summaries (preferred fusion model)
+        metrics_gpkf_row = next((r for r in metrics_rows if r["model"] == "GPKF"), None)
+
+        summary_lines = []
+        # GPKF vs baselines (primary comparison)
+        if metrics_gpkf_row is not None:
+            summary_lines.append(format_comparison(
+                "MODEL COMPARISON SUMMARY (LUR → GPKF at EPA locations)",
+                metrics_lur,
+                metrics_gpkf_row,
+            ))
+            if atmo_pred is not None:
+                summary_lines.append(format_comparison(
+                    "MODEL COMPARISON SUMMARY (ATMO-Plan → GPKF at EPA locations)",
+                    metrics_atmo,
+                    metrics_gpkf_row,
+                ))
+        # SVGP vs baselines (secondary, for reference)
+        summary_lines.append(format_comparison(
+            "MODEL COMPARISON SUMMARY (LUR → SVGP at EPA locations)",
+            metrics_lur,
+            metrics_fusion,
+        ))
+        if atmo_pred is not None:
+            summary_lines.append(format_comparison(
+                "MODEL COMPARISON SUMMARY (ATMO-Plan → SVGP at EPA locations)",
+                metrics_atmo,
+                metrics_fusion,
+            ))
+
+        # ---- Scenario comparison for RQ1 / RQ2 --------------------------------
+        # RQ1: each scenario adds a new information source to the fusion
+        # RQ2: GPKF uncertainty (CRPS, coverage) vs SVGP shows distribution integrity
+        rq_lines = []
+        rq_lines.append("=" * 70)
+        rq_lines.append("RESEARCH QUESTION EVIDENCE SUMMARY")
+        rq_lines.append("=" * 70)
+        rq_lines.append("")
+        rq_lines.append("RQ1 — Unified spatio-temporal fusion of disparate sources")
+        rq_lines.append("  Scenario 1 (Physical model only):  LUR baseline")
+        rq_lines.append("  Scenario 2 (Physical + in-situ):   GPKF with EPA observations only")
+        rq_lines.append("  Scenario 3 (+ remote sensing):     GPKF with EPA + satellite")
+        rq_lines.append("  Scenario 4 (+ traffic/wind prior): GPKF with covariate-informed prior")
+        rq_lines.append("")
+        rq_lines.append("  Model                   RMSE      MAE       Corr     Bias")
+        for row in metrics_rows:
+            rq_lines.append(
+                f"  {row['model']:<22}  {row.get('rmse', float('nan')):>7.3f}  "
+                f"{row.get('mae', float('nan')):>7.3f}  "
+                f"{row.get('corr', float('nan')):>7.4f}  "
+                f"{row.get('bias', float('nan')):>7.3f}"
+            )
+        rq_lines.append("")
+        rq_lines.append("RQ2 — Predictive distribution integrity (calibration)")
+        rq_lines.append("  Lower CRPS / NLL and higher coverage = better-calibrated uncertainty")
+        rq_lines.append("")
+        rq_lines.append("  Model                   CRPS       NLL    Coverage_90  CalibErr_90")
+        for row_label, mdict in [("FusionGP (SVGP)", metrics_dict),
+                                  ("GPKF (sequential)", gpkf_prob_metrics_dict)]:
+            rq_lines.append(
+                f"  {row_label:<22}  {mdict.get('crps', float('nan')):>8.4f}  "
+                f"{mdict.get('nll', float('nan')):>8.4f}  "
+                f"{mdict.get('coverage_90', float('nan')):>10.4f}  "
+                f"{mdict.get('calibration_error_90', float('nan')):>11.4f}"
+            )
+        rq_lines.append("")
+        rq_lines.append(
+            "  Note: coverage_90 ideal = 0.90, calibration_error_90 ideal = 0.00"
+        )
+        rq_lines.append("=" * 70)
+        summary_lines.append("\n".join(rq_lines))
+        # -----------------------------------------------------------------------
+
+        summary_text = "\n\n".join(summary_lines)
+        tqdm.write(summary_text)
+        summary_path = run_dir / "model_comparison_summary.txt"
+        summary_path.write_text(summary_text)
+        tqdm.write(f"Model comparison summary saved to {summary_path}")
+        pbar.update(1)
+
+        # Human-readable report (after summary_text is defined)
+        report_lines = []
+        report_lines.append("# Model Validation Report")
+        report_lines.append("")
+        report_lines.append("## Summary Table (EPA Test Locations)")
+        report_lines.append("")
+        report_lines.extend(md_lines)
+        report_lines.append("")
+        report_lines.append("## Improvement Summary")
+        report_lines.append("")
+        report_lines.append(summary_text)
+        report_path = run_dir / "final_results_report.md"
+        report_path.write_text("\n".join(report_lines))
+        tqdm.write(f"Formatted report saved to {report_path}")
+
+        # Baseline comparison table with R^2 and correlation (EPA reference)
+        epa_mean = float(np.nanmean(y_true))
+        epa_std = float(np.nanstd(y_true))
+        comp_lines = []
+        comp_lines.append(f"BASELINE COMPARISONS (µg/m³, EPA mean={epa_mean:.1f}, std={epa_std:.1f})")
+        comp_lines.append("  Source                    RMSE(µg/m³) MAE(µg/m³)    Corr")
+        for row in metrics_rows:
+            comp_lines.append(
+                f"  {row['model']:<24} {row['rmse']:>10.2f} {row['mae']:>11.2f} "
+                f"{row['corr']:>8.4f}"
+            )
+        comp_text = "\n".join(comp_lines)
+        tqdm.write(comp_text)
+        comp_path = run_dir / "baseline_comparison_table.txt"
+        comp_path.write_text(comp_text)
+        tqdm.write(f"Baseline comparison table saved to {comp_path}")
+
+        # Hyperparameters + likelihood
+        params = model.get_hyperparameters()
+        tqdm.write("Learned Hyperparameters:")
+        tqdm.write("=" * 50)
+        for name, value in params.items():
+            if isinstance(value, np.ndarray):
+                tqdm.write(f"  {name}: {value}")
+            else:
+                tqdm.write(f"  {name}: {value:.4f}")
+
+        tqdm.write("\nLikelihood Parameters:")
+        tqdm.write(str(model.likelihood))
+
+        # Save trained model
+        model_path = run_dir / "fusiongp_model.pt"
+        trainer.save(str(model_path))
+        tqdm.write(f"Model saved to {model_path}")
+        pbar.update(1)
+
+        # Training summary text (captures key console outputs)
+        summary_lines = []
+        summary_lines.append("TRAINING SUMMARY")
+        summary_lines.append("=" * 70)
+        summary_lines.append(f"Run dir: {run_dir}")
+        summary_lines.append(f"n_inducing: {n_inducing}")
+        summary_lines.append(f"n_epochs: {n_epochs}")
+        summary_lines.append(f"batch_size: {128 if fast_run else 512}")
+        summary_lines.append(f"learning_rate: 0.01")
+        summary_lines.append(f"training_time_minutes: {train_seconds/60:.2f}")
+        summary_lines.append("")
+        summary_lines.append("MODEL")
+        summary_lines.append("-" * 70)
+        summary_lines.append(str(model))
+        summary_lines.append("")
+        summary_lines.append("PREDICTIONS SUMMARY")
+        summary_lines.append("-" * 70)
+        summary_lines.append(predictions.summary())
+        summary_lines.append("")
+        summary_lines.append("EVALUATION METRICS")
+        summary_lines.append("-" * 70)
+        summary_lines.append(metrics.summary())
+        summary_lines.append("")
+        summary_lines.append("BASELINE COMPARISON")
+        summary_lines.append("-" * 70)
+        summary_lines.append(comp_text)
+        summary_lines.append("")
+        summary_lines.append("COMPARISON SUMMARY")
+        summary_lines.append("-" * 70)
+        summary_lines.append(summary_text)
+        summary_lines.append("")
+        summary_lines.append("HYPERPARAMETERS")
+        summary_lines.append("-" * 70)
+        for name, value in params.items():
+            if isinstance(value, np.ndarray):
+                summary_lines.append(f"  {name}: {value}")
+            else:
+                summary_lines.append(f"  {name}: {value:.4f}")
+        summary_lines.append("")
+        summary_lines.append("LIKELIHOOD")
+        summary_lines.append("-" * 70)
+        summary_lines.append(str(model.likelihood))
+
+        training_summary_path = run_dir / "training_summary.txt"
+        training_summary_path.write_text("\n".join(summary_lines))
+        tqdm.write(f"Training summary saved to {training_summary_path}")
+
+        total_seconds = time.time() - pipeline_start
+        tqdm.write(f"\nTotal pipeline time: {total_seconds/60:.2f} minutes ({total_seconds:.0f}s)")
+    finally:
+        pbar.close()
+
+    # RQ2 inducing-point sweep — runs after main pipeline when --sweep is passed.
+    # Subprocesses (spawned by the sweep itself) skip this via --_subprocess.
+    if args.sweep and not args._subprocess:
+        _run_rq2_sweep(args.sweep_values, run_tag, data_dir)
+
+
+if __name__ == "__main__":
+    main()

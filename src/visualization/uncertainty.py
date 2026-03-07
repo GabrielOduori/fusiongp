@@ -71,7 +71,7 @@ def plot_uncertainty(
         edgecolors='none',
     )
     
-    cbar = plt.colorbar(scatter, ax=ax, label='Std Dev (ppb)')
+    cbar = plt.colorbar(scatter, ax=ax, label='Std Dev (µg/m³)')
     
     ax.set_xlabel("Longitude")
     ax.set_ylabel("Latitude")
@@ -93,7 +93,7 @@ def plot_confidence_intervals(
     y_true: Optional[np.ndarray] = None,
     confidence_levels: list = [0.5, 0.9, 0.95],
     xlabel: str = "Index",
-    ylabel: str = "NO₂ (ppb)",
+    ylabel: str = "NO₂ (µg/m³)",
     title: str = "Predictions with Confidence Intervals",
     figsize: Tuple[int, int] = (12, 6),
     save_path: Optional[Union[str, Path]] = None,

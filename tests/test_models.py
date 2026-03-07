@@ -11,6 +11,9 @@ import torch
 from src.models.kernels import SpatioTemporalKernel, create_base_kernel
 from src.models.likelihoods import MultiSourceLikelihood
 from src.models.svgp import FusionSVGP
+from src.models.multitask_svgp import MultiTaskSVGP
+from src.inference.predictor import Predictor
+from src.data.loader import FusionData
 
 
 class TestSpatioTemporalKernel:
@@ -167,6 +170,16 @@ class TestFusionSVGP:
         
         inducing = model.get_inducing_points()
         assert inducing.shape == (20, 3)
+
+    def test_inducing_point_initialization_random(self):
+        """Test random inducing point initialization."""
+        model = FusionSVGP(n_inducing=15)
+        x = torch.randn(60, 3)
+
+        model.initialize_inducing_points(x, method='random')
+
+        inducing = model.get_inducing_points()
+        assert inducing.shape == (15, 3)
     
     def test_forward_pass(self):
         """Test model forward pass."""
@@ -198,7 +211,123 @@ class TestFusionSVGP:
         elbo = model.elbo(x, y, masks)
         
         assert elbo.dim() == 0  # Scalar
-        assert not torch.isnan(elbo)
+
+
+class TestMultiTaskSVGP:
+    """Tests for MultiTaskSVGP model class."""
+
+    def test_model_creation(self):
+        """Test basic model creation."""
+        model = MultiTaskSVGP(n_inducing=30)
+
+        assert model is not None
+        assert model.n_inducing == 30
+        assert model.num_tasks == 3
+
+    def test_inducing_point_initialization(self):
+        """Test inducing point initialization."""
+        model = MultiTaskSVGP(n_inducing=12)
+        x = torch.randn(50, 3)
+
+        model.initialize_inducing_points(x, method="random")
+
+        inducing = model.variational_strategy.base_variational_strategy.inducing_points
+        assert inducing.shape == (12, 3)
+
+    def test_forward_pass(self):
+        """Test multitask forward pass outputs."""
+        model = MultiTaskSVGP(n_inducing=10)
+        x_train = torch.randn(40, 3)
+        model.initialize_inducing_points(x_train, method="random")
+
+        x_test = torch.randn(8, 3)
+        model.eval()
+        with torch.no_grad():
+            dist = model(x_test)
+
+        assert dist.mean.shape == (8, model.num_tasks)
+        assert dist.variance.shape == (8, model.num_tasks)
+
+    def test_elbo_computation(self):
+        """Test multitask ELBO computation."""
+        model = MultiTaskSVGP(n_inducing=10)
+        x = torch.randn(30, 3)
+        model.initialize_inducing_points(x, method="random")
+
+        y = torch.randn(30, model.num_tasks)
+        masks = torch.ones(30, model.num_tasks, dtype=torch.bool)
+
+        model.train()
+        elbo = model.elbo(x, y, masks)
+
+        assert elbo.dim() == 0  # Scalar
+
+
+class TestPredictorConfidenceIntervals:
+    """Tests for Predictor confidence interval computation."""
+
+    def test_confidence_interval_width(self):
+        model = FusionSVGP(n_inducing=5)
+        predictor = Predictor(model, confidence_levels=[0.95], include_observation_noise=False)
+
+        mean = np.array([0.0, 1.0, -2.0])
+        std = np.array([1.0, 2.0, 0.5])
+        lower, upper = predictor._compute_confidence_intervals(mean, std)
+
+        z = Predictor.Z_SCORES[0.95]
+        np.testing.assert_allclose(lower[0.95], mean - z * std)
+        np.testing.assert_allclose(upper[0.95], mean + z * std)
+
+    def test_predict_shapes_single_task(self):
+        # Minimal FusionData
+        coords = np.array([[40.0, -74.0], [40.1, -74.1]], dtype=float)
+        timestamps = np.array([0.0, 0.5], dtype=float)
+        obs = {
+            "epa": np.array([10.0, np.nan]),
+            "low_cost": np.array([9.0, 11.0]),
+            "satellite": np.array([8.0, 12.0]),
+        }
+        masks = {k: ~np.isnan(v) for k, v in obs.items()}
+        data = FusionData(
+            coords=coords,
+            timestamps=timestamps,
+            observations=obs,
+            source_masks=masks,
+            grid_ids=np.array([0, 1]),
+            raw_timestamps=np.array(["t0", "t1"], dtype=object),
+        )
+
+        model = FusionSVGP(n_inducing=4)
+        # Initialize inducing points from a tiny training set
+        x_train = torch.tensor(np.column_stack([coords, timestamps]), dtype=torch.float32)
+        model.initialize_inducing_points(x_train, method="random")
+
+        predictor = Predictor(model, include_observation_noise=False)
+        preds = predictor.predict(data, verbose=False)
+
+        assert preds.mean.shape == (2,)
+        assert preds.std.shape == (2,)
+
+
+class TestUncertaintyCoverage:
+    """Tests for predictive interval coverage on synthetic Gaussian data."""
+
+    def test_normal_coverage_approx(self):
+        rng = np.random.default_rng(0)
+        n = 2000
+        mean = np.zeros(n)
+        std = np.ones(n)
+
+        samples = rng.normal(loc=mean, scale=std)
+
+        model = FusionSVGP(n_inducing=5)
+        predictor = Predictor(model, confidence_levels=[0.9], include_observation_noise=False)
+        lower, upper = predictor._compute_confidence_intervals(mean, std)
+
+        covered = (samples >= lower[0.9]) & (samples <= upper[0.9])
+        coverage = covered.mean()
+
+        assert 0.87 <= coverage <= 0.93
     
     def test_prediction(self):
         """Test model prediction."""

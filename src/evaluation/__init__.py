@@ -2,7 +2,7 @@
 Evaluation utilities for FusionGP.
 
 This module provides comprehensive evaluation metrics for probabilistic models:
-- Point prediction metrics (RMSE, MAE, R², Bias)
+- Point prediction metrics (RMSE, MSE, MAE, Bias)
 - Probabilistic metrics (NLL, CRPS, DSS, Energy Score)
 - Calibration diagnostics (coverage, sharpness, PIT)
 
@@ -21,6 +21,7 @@ from src.evaluation.metrics import (
     Evaluator,
     compute_metrics,
     rmse,
+    mse,
     mae,
     r_squared,
     bias,
@@ -35,6 +36,7 @@ __all__ = [
     "Evaluator",
     "compute_metrics",
     "rmse",
+    "mse",
     "mae",
     "r_squared",
     "bias",

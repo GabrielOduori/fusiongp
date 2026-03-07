@@ -19,6 +19,47 @@
 - **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_LC, σ²_SAT)
 - **Scalable Inference**: SVGP with inducing points enables O(NM²) complexity instead of O(N³)
 - **Uncertainty Quantification**: Full predictive distributions with calibrated uncertainty
+- **LUR Prior Mean**: Optional land-use regression (LUR) prior provides a spatial baseline
+- **Sequential Fusion**: GP-Kalman Filter (GPKF) for day-by-day updates from a LUR prior
+- **Smoothing**: Kalman smoother for temporally consistent posterior maps
+
+## End-to-End Pipeline (Demo)
+
+The full demo pipeline in `experiments/run_demo_pipeline.py` includes:
+
+1. Build merged daily dataset from raw sources
+2. Load data + covariates, preprocess, and split
+3. Build a LUR prior mean over the grid
+4. Train FusionSVGP (batch variational GP)
+5. Predict and evaluate (SVGP)
+6. Run Kalman smoother for day-by-day tracking
+7. Run GP-Kalman Filter (GPKF) for sequential fusion from the LUR prior
+8. Save maps, metrics, and reports
+
+Run it with:
+
+```bash
+python experiments/run_demo_pipeline.py
+```
+
+### Pipeline Diagram
+
+```mermaid
+flowchart TD
+  A[Raw Sources] --> B[Merged Daily Dataset]
+  B --> C[Covariates + Preprocess + Split]
+  C --> D[LUR Prior Mean]
+  C --> E[Train FusionSVGP]
+  E --> F[SVGP Predictions + Eval]
+  D --> G[GP-Kalman Filter (Sequential Fusion)]
+  C --> G
+  G --> H[GPKF Maps + Metrics]
+  E --> I[Kalman Smoother]
+  I --> J[Smoothed Maps]
+  F --> K[Reports + Figures]
+  H --> K
+  J --> K
+```
 
 ## Mathematical Formulation
 
@@ -74,6 +115,44 @@ pip install -e .
 pip install torch gpytorch pandas numpy scipy scikit-learn matplotlib seaborn tqdm pyyaml
 ```
 
+## Data Setup
+
+Place your data files in the `data/` folder at the repository root:
+
+```
+fusiongp/
+└── data/
+    ├── satellite_retreavals.csv       # TROPOMI satellite NO₂ retrievals
+    ├── epa_timeseries.csv             # EPA reference station time series
+    ├── traffic_timeseries.csv         # Traffic volume time series
+    ├── lur_predictions.csv            # Land-use regression predictions
+    ├── grids_coordinates.csv          # Grid cell coordinates (lat/lon)
+    ├── atmos_plan_model_no2.csv       # AtmoPlan model NO₂ (optional baseline)
+    └── wind_sector_features_era5land_2023-06_daily.csv  # Wind covariates (optional)
+```
+
+The pipeline automatically discovers data from `data/` when run without arguments:
+
+```bash
+python experiments/run_demo_pipeline.py
+```
+
+To use a different data directory:
+
+```bash
+python experiments/run_demo_pipeline.py --data-dir /path/to/your/data
+```
+
+### Verifying your setup
+
+The pipeline checks for all required files before training starts and will immediately report any that are missing. To validate your data without running any training (~2 minutes):
+
+```bash
+python experiments/run_demo_pipeline.py --data-only
+```
+
+This builds the merged dataset and exports UQ CSVs, confirming all data files are readable and correctly formatted.
+
 ## Quick Start
 
 ```python
@@ -122,7 +201,7 @@ plot_uncertainty(predictions, save_path="results/uncertainty.png")
 fusiongp/
 ├── README.md                    # This file
 ├── pyproject.toml              # Project configuration and dependencies
-├── fusiongp/
+├── src/
 │   ├── __init__.py             # Package initialization
 │   ├── data/
 │   │   ├── __init__.py
@@ -139,7 +218,9 @@ fusiongp/
 │   │   └── callbacks.py        # Early stopping, checkpointing, scheduling
 │   ├── inference/
 │   │   ├── __init__.py
-│   │   └── predictor.py        # Gridded predictions with uncertainty
+│   │   ├── predictor.py        # Gridded predictions with uncertainty
+│   │   ├── kalman_smoother.py   # Temporal smoothing over SVGP outputs
+│   │   └── gp_kalman_filter.py  # Sequential fusion from LUR prior
 │   ├── evaluation/
 │   │   ├── __init__.py
 │   │   ├── metrics.py          # Comprehensive evaluation metrics
