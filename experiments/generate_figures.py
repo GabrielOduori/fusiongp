@@ -1,17 +1,28 @@
 """
-Publication-quality map generation for FusionGP outputs.
+Figure generation for FusionGP outputs.
 
-Reads GPKF and Kalman smoother daily CSVs and generates enhanced figures:
-  - Gaussian smoothing (removes blocky pixel artefacts)
-  - Combined mean + std side-by-side figure per day
-  - EPA station overlay
-  - Percentile-clipped colourmaps
-  - OpenStreetMap basemap via contextily
-  - Domain-averaged NO₂ time series (GPKF vs Kalman smoother)
-  - Daily EPA observed vs SVGP predicted time series
+Reads all saved CSVs from a completed pipeline run and generates every figure.
+Run this independently of the pipeline to regenerate or tweak plots without
+re-training.
+
+Figures produced:
+  Spatial maps (publication quality):
+    - Per-day GPKF mean + uncertainty side-by-side with OSM basemap
+    - Static LUR and ATMO-Plan baseline maps
+    - SVGP fusion prediction and uncertainty maps
+    - Gaussian smoothing, EPA station overlay, percentile-clipped colourmaps
+
+  Diagnostics:
+    - Training loss curves (train / val)
+    - SVGP calibration and residual analysis
+    - GPKF calibration diagnostic
+
+  Time series:
+    - Domain-averaged NO₂ over time (GPKF vs Kalman smoother, mean ± 1σ)
+    - Daily EPA observed vs FusionSVGP predicted
 
 Usage:
-    python experiments/plot_publication_maps.py [run_dir]
+    python experiments/generate_figures.py [run_dir]
 
 If run_dir is omitted, the most-recent outputs/demo_run_* is used.
 """
@@ -545,6 +556,160 @@ def plot_timeseries(run_dir: Path, pub_dir: Path):
 
 
 # ---------------------------------------------------------------------------
+# Diagnostic plots (training, SVGP, GPKF)
+# ---------------------------------------------------------------------------
+
+def plot_training_history(run_dir: Path, pub_dir: Path):
+    """
+    Plot training and validation loss curves from training_history.csv.
+
+    Saved to pub_dir/training_history.png.
+    """
+    csv = run_dir / "training_history.csv"
+    if not csv.exists():
+        print(f"Skipping training history: {csv} not found")
+        return
+
+    df = pd.read_csv(csv)
+    pub_dir.mkdir(parents=True, exist_ok=True)
+
+    fig, ax = plt.subplots(figsize=(9, 4))
+    ax.plot(df["epoch"], df["train_loss"], color="steelblue", linewidth=1.8, label="Train loss")
+    if "val_loss" in df.columns and df["val_loss"].notna().any():
+        ax.plot(df["epoch"], df["val_loss"], color="darkorange", linewidth=1.8,
+                linestyle="--", label="Val loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("ELBO loss")
+    ax.set_title("SVGP training history")
+    ax.legend(fontsize=10)
+    ax.grid(True, alpha=0.3)
+    fig.tight_layout()
+    out = pub_dir / "training_history.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+def plot_svgp_diagnostics(run_dir: Path, pub_dir: Path):
+    """
+    Calibration scatter and residual histogram for SVGP predictions vs EPA.
+
+    Reads predictions.csv (columns: mean, std, epa_true, is_epa).
+    Saved to pub_dir/svgp_diagnostics.png.
+    """
+    csv = run_dir / "predictions.csv"
+    if not csv.exists():
+        print(f"Skipping SVGP diagnostics: {csv} not found")
+        return
+
+    df = pd.read_csv(csv)
+    epa = df[(df["is_epa"] == True) & df["epa_true"].notna() & df["mean"].notna()]
+    if epa.empty:
+        print("Skipping SVGP diagnostics: no valid EPA rows in predictions.csv")
+        return
+
+    pub_dir.mkdir(parents=True, exist_ok=True)
+    y_true = epa["epa_true"].values
+    y_pred = epa["mean"].values
+    residuals = y_true - y_pred
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("SVGP diagnostics — EPA test-set predictions", fontsize=13, weight="bold")
+
+    # Calibration scatter
+    ax = axes[0]
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    ax.scatter(y_true, y_pred, s=20, alpha=0.5, color="steelblue", edgecolors="none")
+    ax.plot(lims, lims, "k--", linewidth=1.2, label="1:1 line")
+    ax.set_xlabel("EPA observed (µg/m³)")
+    ax.set_ylabel("SVGP predicted (µg/m³)")
+    ax.set_title("Predicted vs observed")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Residual histogram
+    ax = axes[1]
+    ax.hist(residuals, bins=30, color="steelblue", edgecolor="white", alpha=0.8)
+    ax.axvline(0, color="k", linewidth=1.2, linestyle="--")
+    ax.axvline(residuals.mean(), color="darkorange", linewidth=1.4,
+               linestyle="-", label=f"Mean = {residuals.mean():.2f}")
+    ax.set_xlabel("Residual: observed − predicted (µg/m³)")
+    ax.set_ylabel("Count")
+    ax.set_title("Residual distribution")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out = pub_dir / "svgp_diagnostics.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+def plot_gpkf_diagnostics(run_dir: Path, pub_dir: Path):
+    """
+    Calibration scatter and normalised-error histogram for GPKF predictions vs EPA.
+
+    Reads gpkf_epa_predictions.csv (columns: epa_true, gpkf_pred, gpkf_pred_std).
+    Saved to pub_dir/gpkf_diagnostics.png.
+    """
+    csv = run_dir / "gpkf_epa_predictions.csv"
+    if not csv.exists():
+        print(f"Skipping GPKF diagnostics: {csv} not found")
+        return
+
+    df = pd.read_csv(csv)
+    valid = df["epa_true"].notna() & df["gpkf_pred"].notna() & df["gpkf_pred_std"].notna()
+    df = df[valid]
+    if df.empty:
+        print("Skipping GPKF diagnostics: no valid rows in gpkf_epa_predictions.csv")
+        return
+
+    pub_dir.mkdir(parents=True, exist_ok=True)
+    y_true = df["epa_true"].values
+    y_pred = df["gpkf_pred"].values
+    y_std  = df["gpkf_pred_std"].values
+    z_scores = (y_true - y_pred) / np.maximum(y_std, 1e-6)
+
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+    fig.suptitle("GPKF diagnostics — EPA test-set predictions", fontsize=13, weight="bold")
+
+    # Calibration scatter with ±1σ error bars
+    ax = axes[0]
+    lims = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
+    ax.errorbar(y_true, y_pred, yerr=y_std, fmt="o", markersize=4,
+                alpha=0.5, color="steelblue", ecolor="lightsteelblue",
+                elinewidth=0.8, capsize=0)
+    ax.plot(lims, lims, "k--", linewidth=1.2, label="1:1 line")
+    ax.set_xlabel("EPA observed (µg/m³)")
+    ax.set_ylabel("GPKF predicted (µg/m³)")
+    ax.set_title("Predicted vs observed (±1σ)")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    # Normalised-error histogram (should be ~N(0,1) if well-calibrated)
+    ax = axes[1]
+    ax.hist(z_scores, bins=30, color="steelblue", edgecolor="white", alpha=0.8,
+            density=True, label="z-scores")
+    # Overlay standard normal
+    zx = np.linspace(-4, 4, 200)
+    ax.plot(zx, np.exp(-0.5 * zx**2) / np.sqrt(2 * np.pi),
+            "k--", linewidth=1.4, label="N(0,1)")
+    ax.axvline(0, color="grey", linewidth=0.8)
+    ax.set_xlabel("Normalised error (z-score)")
+    ax.set_ylabel("Density")
+    ax.set_title("Calibration: normalised error distribution")
+    ax.legend(fontsize=9)
+    ax.grid(True, alpha=0.3)
+
+    fig.tight_layout()
+    out = pub_dir / "gpkf_diagnostics.png"
+    fig.savefig(out, dpi=DPI, bbox_inches="tight")
+    plt.close(fig)
+    print(f"Saved: {out}")
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 def main():
@@ -620,7 +785,14 @@ def main():
     print("\nGenerating time series plots ...")
     plot_timeseries(run_dir, pub_dir / "timeseries")
 
-    print(f"\nAll publication maps saved to: {pub_dir}")
+    # Diagnostic plots
+    diag_dir = pub_dir / "diagnostics"
+    print("\nGenerating diagnostic plots ...")
+    plot_training_history(run_dir, diag_dir)
+    plot_svgp_diagnostics(run_dir, diag_dir)
+    plot_gpkf_diagnostics(run_dir, diag_dir)
+
+    print(f"\nAll figures saved to: {pub_dir}")
 
 
 if __name__ == "__main__":
