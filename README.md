@@ -62,23 +62,27 @@ flowchart TD
 
 ## Maps and Visualisations
 
-After the pipeline has run, publication-quality maps can be regenerated at any time without re-running the full pipeline:
+After the pipeline has run, all figures can be regenerated at any time without re-running the full pipeline:
 
 ```bash
 # Uses the most recent outputs/demo_run_* automatically
-python experiments/plot_publication_maps.py
+python experiments/generate_figures.py
 
 # Or point to a specific run directory
-python experiments/plot_publication_maps.py outputs/demo_run_20240601_120000
+python experiments/generate_figures.py outputs/demo_run_20240601_120000
 ```
 
-This reads the GPKF and Kalman smoother daily CSVs saved by the pipeline and produces per-day maps showing:
+This reads the CSVs saved by the pipeline and produces all figures inside `<run_dir>/publication_maps/`:
 
-- NO₂ mean concentration and uncertainty (std) side-by-side
-- Gaussian-smoothed heatmaps overlaid on an OpenStreetMap basemap
-- EPA station locations overlaid
+| Sub-directory | Contents |
+|---|---|
+| `gpkf/` | Per-day GPKF mean + uncertainty side-by-side maps |
+| `svgp/` | Per-day SVGP fusion mean + uncertainty maps |
+| `baselines/` | LUR and Atmo-Plan static baseline maps |
+| `timeseries/` | Domain-averaged NO₂ over time; EPA observed vs SVGP predicted |
+| `diagnostics/` | Training loss curves; SVGP calibration + residuals; GPKF calibration |
 
-Maps are saved as high-resolution PNGs inside the run directory.
+All spatial maps use Gaussian-smoothed heatmaps overlaid on a basemap with EPA station locations.
 
 **Optional:** For higher-quality basemap tiles, add a Stadia Maps API key to a `.env` file at the project root:
 
