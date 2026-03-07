@@ -195,7 +195,7 @@ class FusionSVGP(ApproximateGP):
         self.temporal_kernel_type = temporal_kernel_type or kernel_type
         
         # Default sources
-        self.sources = sources if sources else ['epa', 'low_cost', 'satellite']
+        self.sources = sources if sources else ['epa', 'satellite']
         
         # Default lengthscales
         ls_init = initial_lengthscales or {}

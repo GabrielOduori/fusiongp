@@ -45,22 +45,22 @@ class MultiSourceLikelihood(Likelihood):
     """
     Heteroscedastic Gaussian likelihood for multi-source observations.
     
-    This likelihood handles observations from multiple sources (EPA, low-cost
-    sensors, satellite) with:
+    This likelihood handles observations from multiple sources (EPA, satellite)
+    with:
     - Source-specific noise variances
-    - Linear calibration for low-cost sensors (y = a*f + b)
     - Masking for missing observations
+    - Optional linear calibration for auxiliary sources (y = a*f + b)
     
     The noise variances and calibration parameters can be learned during
     training via gradient descent.
     
     Parameters
     ----------
-    sources : List[str], default=['epa', 'low_cost', 'satellite']
+    sources : List[str], default=['epa', 'satellite']
         List of source names.
     initial_noise : Dict[str, float], optional
         Initial noise standard deviations per source.
-        Default: {'epa': 1.0, 'low_cost': 5.0, 'satellite': 3.0}
+        Default: {'epa': 1.0, 'satellite': 3.0}
     learn_noise : bool, default=True
         Whether to learn noise parameters.
     learn_noise_sources : List[str], optional
@@ -68,7 +68,7 @@ class MultiSourceLikelihood(Likelihood):
     noise_bounds : Tuple[float, float], default=(0.01, 100.0)
         Bounds for noise standard deviations.
     initial_calibration : Dict[str, float], optional
-        Initial calibration parameters for low-cost sensors.
+        Initial calibration parameters for auxiliary sources (if used).
         Default: {'slope': 1.0, 'intercept': 0.0}
     learn_calibration : bool, default=True
         Whether to learn calibration parameters.
@@ -142,7 +142,7 @@ class MultiSourceLikelihood(Likelihood):
         super().__init__()
         
         # Set sources
-        self.sources = sources if sources else ['epa', 'low_cost', 'satellite']
+        self.sources = sources if sources else ['epa', 'satellite']
         self.source_to_idx = {s: i for i, s in enumerate(self.sources)}
         
         # Merge defaults with provided values
@@ -525,7 +525,7 @@ class MaskedMultitaskGaussianLikelihood(Likelihood):
     ):
         super().__init__()
 
-        self.sources = sources if sources else ['epa', 'low_cost', 'satellite']
+        self.sources = sources if sources else ['epa', 'satellite']
         self.source_to_idx = {s: i for i, s in enumerate(self.sources)}
 
         noise_init = {**self.DEFAULT_NOISE}
