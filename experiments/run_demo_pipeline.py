@@ -627,16 +627,29 @@ def main() -> None:
         gc.collect()   # release any remaining large arrays before training
         merged_path = derived_path
 
+        # ---------------------------------------------------------------------------
+        # SOURCE CONFIGURATION — edit here to add/remove observation sources.
+        #
+        # Each entry: source_name -> {"column": <csv column>, "noise": <initial σ>}
+        #
+        # To add low-cost sensors when available:
+        #   "low_cost": {"column": "lcs_no2", "noise": 5.0},
+        # ---------------------------------------------------------------------------
+        SOURCE_CONFIG = {
+            "epa":       {"column": "epa_no2",       "noise": 0.5},
+            "satellite": {"column": "satellite_no2", "noise": 3.0},
+            # "low_cost": {"column": "lcs_no2",      "noise": 5.0},
+        }
+
         # Load merged dataset
         loader = DataLoader(
             merged_path,
             column_mapping={
-                "grid_id": "grid_id",
-                "latitude": "latitude",
+                "grid_id":   "grid_id",
+                "latitude":  "latitude",
                 "longitude": "longitude",
                 "timestamp": "timestamp",
-                "satellite": "satellite_no2",
-                "epa": "epa_no2",
+                **{src: cfg["column"] for src, cfg in SOURCE_CONFIG.items()},
             },
             covariate_columns=covariate_columns,
         )
@@ -761,8 +774,8 @@ def main() -> None:
             temporal_kernel_type="exponential",  # Exponential for rapid temporal decay
             spatial_ard=True,
             learn_inducing_locations=True,
-            sources=["epa", "satellite"],
-            initial_noise={"epa": 0.5, "satellite": 3.0},
+            sources=list(SOURCE_CONFIG.keys()),
+            initial_noise={src: cfg["noise"] for src, cfg in SOURCE_CONFIG.items()},
             initial_lengthscales={"spatial_x": 0.4, "spatial_y": 0.4, "temporal": 0.3},
             n_covariates=len(covariate_columns),
             prior_mean=prior_mean,
