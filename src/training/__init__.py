@@ -18,10 +18,12 @@ ModelCheckpoint
 """
 
 from src.training.trainer import Trainer
+from src.training.st_svgp_trainer import STSVGPTrainer
 from src.training.callbacks import EarlyStopping, ModelCheckpoint, LRScheduler
 
 __all__ = [
     "Trainer",
+    "STSVGPTrainer",
     "EarlyStopping",
     "ModelCheckpoint",
     "LRScheduler",

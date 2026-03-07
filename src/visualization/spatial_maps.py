@@ -25,6 +25,7 @@ def create_spatial_maps(
     output_dir: str = 'outputs/spatial_maps',
     cmap_mean: str = 'RdYlBu_r',
     cmap_std: str = 'plasma',
+    task: str = "epa",
 ):
     """
     Create spatial prediction and uncertainty maps for multiple timestamps.
@@ -98,7 +99,8 @@ def create_spatial_maps(
             coords=coords,
             timestamps=times,
             normalized=False,
-            verbose=False
+            verbose=False,
+            task=task,
         )
 
         # Reshape to grid
@@ -154,6 +156,7 @@ def create_animation_frames(
     output_dir: str = 'outputs/animation_frames',
     show_observations: bool = False,
     obs_coords: Optional[np.ndarray] = None,
+    task: str = "epa",
 ):
     """
     Create frames for temporal animation of predictions.
@@ -199,7 +202,13 @@ def create_animation_frames(
     all_means = []
     for timestamp in timestamps[:5]:  # Sample a few for range
         times = np.full(len(coords), timestamp)
-        preds = predictor.predict_locations(coords, times, normalized=False, verbose=False)
+        preds = predictor.predict_locations(
+            coords,
+            times,
+            normalized=False,
+            verbose=False,
+            task=task,
+        )
         all_means.append(preds.mean)
 
     vmin = np.percentile(np.concatenate(all_means), 2)
@@ -214,7 +223,8 @@ def create_animation_frames(
             coords=coords,
             timestamps=times,
             normalized=False,
-            verbose=False
+            verbose=False,
+            task=task,
         )
 
         mean_map = predictions.mean.reshape(lat_grid.shape)

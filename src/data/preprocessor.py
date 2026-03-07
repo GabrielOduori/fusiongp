@@ -55,6 +55,9 @@ class Scalers:
         Minimum coordinate values, shape (2,).
     coord_max : np.ndarray
         Maximum coordinate values, shape (2,).
+    coord_scale : float
+        Scaling factor for coordinates (max range across lat/lon).
+        Used for isotropic scaling to preserve aspect ratio.
     time_min : float
         Minimum timestamp value.
     time_max : float
@@ -63,32 +66,44 @@ class Scalers:
         Mean observation value per source.
     target_std : Dict[str, float]
         Standard deviation of observations per source.
+    covariate_mean : np.ndarray
+        Mean of covariate columns.
+    covariate_std : np.ndarray
+        Standard deviation of covariate columns.
+    covariate_names : List[str]
+        Names of covariate columns.
     normalize_targets : bool
         Whether targets were normalized.
     """
     coord_min: np.ndarray
     coord_max: np.ndarray
+    coord_scale: float
     time_min: float
     time_max: float
     target_mean: Dict[str, float] = field(default_factory=dict)
     target_std: Dict[str, float] = field(default_factory=dict)
+    covariate_mean: np.ndarray = field(default_factory=lambda: np.array([]))
+    covariate_std: np.ndarray = field(default_factory=lambda: np.array([]))
+    covariate_names: List[str] = field(default_factory=list)
     normalize_targets: bool = False
     
     def inverse_transform_coords(self, coords: np.ndarray) -> np.ndarray:
         """
         Inverse transform normalized coordinates back to original scale.
-        
+
+        Uses isotropic scaling to preserve aspect ratio.
+
         Parameters
         ----------
         coords : np.ndarray
             Normalized coordinates, shape (..., 2).
-            
+
         Returns
         -------
         np.ndarray
             Original-scale coordinates.
         """
-        return coords * (self.coord_max - self.coord_min) + self.coord_min
+        return coords * self.coord_scale + self.coord_min
     
     def inverse_transform_time(self, time: np.ndarray) -> np.ndarray:
         """
@@ -138,6 +153,24 @@ class Scalers:
         offset = self.target_mean[source]
         
         return mean * scale + offset, std * scale
+
+    def transform_covariates(self, covariates: np.ndarray) -> np.ndarray:
+        """
+        Standardize covariates using fitted mean/std.
+
+        Parameters
+        ----------
+        covariates : np.ndarray
+            Covariate matrix, shape (N, K).
+
+        Returns
+        -------
+        np.ndarray
+            Standardized covariates.
+        """
+        if covariates.size == 0:
+            return covariates
+        return (covariates - self.covariate_mean) / self.covariate_std
 
 
 class DataPreprocessor:
@@ -251,14 +284,35 @@ class DataPreprocessor:
             else:
                 target_mean[source] = 0.0
                 target_std[source] = 1.0
-        
+
+        # Compute isotropic scaling factor (max range across dimensions)
+        coord_range = coord_max - coord_min
+        coord_scale = float(coord_range.max())
+
+        # Compute covariate statistics if present
+        covariate_mean = np.array([])
+        covariate_std = np.array([])
+        covariate_names = []
+        if getattr(data, "covariates", None) is not None:
+            covariates = data.covariates
+            covariate_mean = np.nanmean(covariates, axis=0)
+            covariate_std = np.nanstd(covariates, axis=0)
+            covariate_std[covariate_std == 0] = 1.0
+            covariate_names = list(
+                data.metadata.get("covariate_names", [f"cov_{i}" for i in range(covariates.shape[1])])
+            )
+
         self.scalers = Scalers(
             coord_min=coord_min,
             coord_max=coord_max,
+            coord_scale=coord_scale,
             time_min=time_min,
             time_max=time_max,
             target_mean=target_mean,
             target_std=target_std,
+            covariate_mean=covariate_mean,
+            covariate_std=covariate_std,
+            covariate_names=covariate_names,
             normalize_targets=self.normalize_targets,
         )
         
@@ -295,9 +349,8 @@ class DataPreprocessor:
         
         # Transform coordinates
         if self.normalize_coords:
-            coords = (data.coords - self.scalers.coord_min) / (
-                self.scalers.coord_max - self.scalers.coord_min
-            )
+            # Use isotropic scaling (same scale for lat and lon) to preserve aspect ratio
+            coords = (data.coords - self.scalers.coord_min) / self.scalers.coord_scale
         else:
             coords = data.coords.copy()
         
@@ -319,6 +372,12 @@ class DataPreprocessor:
             else:
                 obs_transformed = obs.copy()
             observations[source] = obs_transformed
+
+        # Transform covariates
+        covariates = None
+        if getattr(data, "covariates", None) is not None:
+            covariates = self.scalers.transform_covariates(data.covariates)
+            covariates = np.nan_to_num(covariates, nan=0.0)
         
         # Create transformed FusionData
         transformed = FusionData(
@@ -328,6 +387,7 @@ class DataPreprocessor:
             source_masks={k: v.copy() for k, v in data.source_masks.items()},
             grid_ids=data.grid_ids.copy(),
             raw_timestamps=data.raw_timestamps.copy(),
+            covariates=covariates,
             metadata={**data.metadata, 'preprocessed': True},
         )
         
@@ -435,6 +495,11 @@ class DataPreprocessor:
         else:
             raise ValueError(f"Unknown split strategy: {split_strategy}")
         
+        # Store split indices so callers can reconstruct raw subsets (e.g. GPKF)
+        self.train_indices_ = train_idx
+        self.val_indices_ = val_idx
+        self.test_indices_ = test_idx
+
         # Fit on training data only
         train_subset = self._subset_data(data, train_idx)
         self.fit(train_subset)
@@ -469,6 +534,10 @@ class DataPreprocessor:
         FusionData
             Subset of the data.
         """
+        covariates = None
+        if getattr(data, "covariates", None) is not None:
+            covariates = data.covariates[indices]
+
         return FusionData(
             coords=data.coords[indices],
             timestamps=data.timestamps[indices],
@@ -476,6 +545,7 @@ class DataPreprocessor:
             source_masks={k: v[indices] for k, v in data.source_masks.items()},
             grid_ids=data.grid_ids[indices],
             raw_timestamps=data.raw_timestamps[indices],
+            covariates=covariates,
             metadata={**data.metadata, 'subset_size': len(indices)},
         )
     

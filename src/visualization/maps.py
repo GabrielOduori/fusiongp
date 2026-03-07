@@ -32,7 +32,7 @@ def plot_predictions(
     vmin: Optional[float] = None,
     vmax: Optional[float] = None,
     figsize: Tuple[int, int] = (10, 8),
-    colorbar_label: str = "NO₂ (ppb)",
+    colorbar_label: str = "NO₂ (µg/m³)",
     marker_size: float = 20,
     save_path: Optional[Union[str, Path]] = None,
     ax: Optional[plt.Axes] = None,
@@ -165,7 +165,7 @@ def plot_spatial_field(
         vmin=vmin, vmax=vmax,
         s=20, edgecolors='none'
     )
-    plt.colorbar(scatter1, ax=ax1, label='NO₂ (ppb)')
+    plt.colorbar(scatter1, ax=ax1, label='NO₂ (µg/m³)')
     ax1.set_title('Predicted Mean')
     ax1.set_xlabel('Longitude')
     ax1.set_ylabel('Latitude')
@@ -179,7 +179,7 @@ def plot_spatial_field(
         c=std, cmap='YlOrRd',
         s=20, edgecolors='none'
     )
-    plt.colorbar(scatter2, ax=ax2, label='Std Dev (ppb)')
+    plt.colorbar(scatter2, ax=ax2, label='Std Dev (µg/m³)')
     ax2.set_title('Prediction Uncertainty')
     ax2.set_xlabel('Longitude')
     ax2.set_ylabel('Latitude')
@@ -196,7 +196,7 @@ def plot_spatial_field(
             vmin=vmin, vmax=vmax,
             s=50, edgecolors='black', linewidths=0.5
         )
-        plt.colorbar(scatter3, ax=ax3, label='NO₂ (ppb)')
+        plt.colorbar(scatter3, ax=ax3, label='NO₂ (µg/m³)')
         ax3.set_title('Observations')
         ax3.set_xlabel('Longitude')
         ax3.set_ylabel('Latitude')
@@ -291,7 +291,7 @@ def plot_time_series_maps(
     # Add colorbar
     fig.subplots_adjust(right=0.85)
     cbar_ax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
-    cbar = fig.colorbar(scatter, cax=cbar_ax, label='NO₂ (ppb)')
+    cbar = fig.colorbar(scatter, cax=cbar_ax, label='NO₂ (µg/m³)')
     
     fig.suptitle(title, fontsize=14, y=0.98)
     

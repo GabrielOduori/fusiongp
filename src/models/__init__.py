@@ -24,11 +24,21 @@ References
 """
 
 from src.models.kernels import SpatioTemporalKernel
-from src.models.likelihoods import MultiSourceLikelihood
+from src.models.likelihoods import MultiSourceLikelihood, MaskedMultitaskGaussianLikelihood
 from src.models.svgp import FusionSVGP
+from src.models.st_svgp import STSVGPModel, STSVGPConfig
+from src.models.multitask_svgp import MultiTaskSVGP
+from src.models.prior_mean import GridPriorMean, RasterMean, ATMOPlanMean
 
 __all__ = [
     "FusionSVGP",
+    "MultiTaskSVGP",
     "SpatioTemporalKernel",
     "MultiSourceLikelihood",
+    "MaskedMultitaskGaussianLikelihood",
+    "STSVGPModel",
+    "STSVGPConfig",
+    "GridPriorMean",
+    "RasterMean",
+    "ATMOPlanMean",
 ]

@@ -37,6 +37,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 import torch
+import gpytorch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
@@ -305,8 +306,11 @@ class Trainer:
         # Initialize inducing points from training data
         train_dataset = FusionDataset(train_data)
         train_x = train_dataset.get_input_tensor().to(self.device)
-        self.model.initialize_inducing_points(train_x, method='kmeans')
-        
+
+        # Use structured_grid for gridded data to enable Kronecker optimizations
+        # Falls back gracefully if data isn't gridded
+        self.model.initialize_inducing_points(train_x, method='structured_grid')
+
         # Create data loader
         train_loader = DataLoader(
             train_dataset,
@@ -321,16 +325,17 @@ class Trainer:
             val_x = val_dataset.get_input_tensor().to(self.device)
             val_y = val_dataset.observations.to(self.device)
             val_masks = val_dataset.source_masks.to(self.device)
-        
+            self.val_source_names = val_dataset.source_names
+
         # Notify callbacks
         for callback in self.callbacks:
             callback.on_train_begin(self.model)
-        
+
         # Training loop
         self.history = TrainingHistory()
-        
+
         epoch_iterator = tqdm(range(self.n_epochs), desc="Training", disable=not verbose)
-        
+
         for epoch in epoch_iterator:
             epoch_start = time.time()
             
@@ -339,14 +344,25 @@ class Trainer:
             
             # Validation step
             val_loss = None
+            val_epa_rmse = None
             if val_data is not None and (epoch + 1) % self.val_interval == 0:
                 val_loss = self._validate(val_x, val_y, val_masks)
+                val_epa_rmse = self._validate_epa_rmse(val_x, val_y, val_masks)
+                if val_epa_rmse is None and val_loss is not None:
+                    if not getattr(self, "_warned_no_epa", False):
+                        logger.warning(
+                            "Validation has no EPA points; using val_loss for early stopping."
+                        )
+                        self._warned_no_epa = True
+                    val_epa_rmse = val_loss
             
             # Record history
             epoch_time = time.time() - epoch_start
             self.history.train_loss.append(train_loss)
             if val_loss is not None:
                 self.history.val_loss.append(val_loss)
+            if val_epa_rmse is not None:
+                self.history.metrics.setdefault('val_epa_rmse', []).append(val_epa_rmse)
             self.history.learning_rates.append(
                 self.optimizer.param_groups[0]['lr']
             )
@@ -364,6 +380,10 @@ class Trainer:
                 'val_loss': val_loss if val_loss is not None else self.history.val_loss[-1] if self.history.val_loss else train_loss,
                 'epoch': epoch,
             }
+            if val_epa_rmse is not None:
+                logs['val_epa_rmse'] = val_epa_rmse
+            elif self.history.metrics.get('val_epa_rmse'):
+                logs['val_epa_rmse'] = self.history.metrics['val_epa_rmse'][-1]
             
             continue_training = True
             for callback in self.callbacks:
@@ -393,12 +413,12 @@ class Trainer:
     def _train_epoch(self, train_loader: DataLoader) -> float:
         """
         Run one training epoch.
-        
+
         Parameters
         ----------
         train_loader : DataLoader
             Training data loader.
-            
+
         Returns
         -------
         float
@@ -406,38 +426,56 @@ class Trainer:
         """
         self.model.train()
         self.model.likelihood.train()
-        
+
         total_loss = 0.0
         n_batches = 0
-        
-        for batch in train_loader:
-            coords, timestamps, observations, masks, indices = batch
-            
-            # Combine coords and timestamps
-            x = torch.cat([
+
+        for batch_idx, batch in enumerate(train_loader):
+            coords, timestamps, observations, masks, indices, covariates = batch
+
+            # Combine coords, timestamps, and covariates
+            x_parts = [
                 coords.to(self.device),
-                timestamps.unsqueeze(-1).to(self.device)
-            ], dim=-1)
+                timestamps.unsqueeze(-1).to(self.device),
+                covariates.to(self.device),
+            ]
+            x = torch.cat(x_parts, dim=-1)
             y = observations.to(self.device)
             source_masks = masks.to(self.device)
-            
+
             # Zero gradients
             self.optimizer.zero_grad()
-            
+
+            # Clear gpytorch caches
+            self.model.variational_strategy._memoize_cache.clear()
+
+
             # Compute ELBO (negative loss)
-            elbo = self.model.elbo(x, y, source_masks)
+            elbo = self.model.elbo(x, y, source_masks, n_data=len(train_loader.dataset))
             loss = -elbo / len(x)  # Normalize by batch size
             
             # Backward pass
             loss.backward()
-            
+
+            # Check for NaN gradients and skip update if found
+            has_nan_grad = False
+            for name, param in self.model.named_parameters():
+                if param.grad is not None and torch.isnan(param.grad).any():
+                    has_nan_grad = True
+                    logger.warning(f"NaN gradient detected in {name}, skipping batch {batch_idx}")
+                    break
+
+            if has_nan_grad:
+                self.optimizer.zero_grad()  # Clear the bad gradients
+                continue
+
             # Gradient clipping
             if self.gradient_clip is not None:
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.gradient_clip
                 )
-            
+
             # Update parameters
             self.optimizer.step()
             
@@ -477,6 +515,31 @@ class Trainer:
             loss = -elbo / len(val_x)
         
         return loss.item()
+
+    def _validate_epa_rmse(
+        self,
+        val_x: torch.Tensor,
+        val_y: torch.Tensor,
+        val_masks: torch.Tensor,
+    ) -> Optional[float]:
+        """
+        Compute EPA RMSE on the validation set (normalized scale).
+        """
+        if not hasattr(self, "val_source_names") or "epa" not in self.val_source_names:
+            return None
+        epa_idx = self.val_source_names.index("epa")
+        mask = val_masks[:, epa_idx]
+        if not torch.any(mask):
+            return None
+
+        self.model.eval()
+        with torch.no_grad():
+            pred = self.model(val_x).mean
+            if pred.ndim > 1:
+                pred = pred[:, epa_idx]
+            residual = pred[mask] - val_y[:, epa_idx][mask]
+            rmse = torch.sqrt(torch.mean(residual ** 2))
+        return float(rmse.item())
     
     def save(self, path: str | Path) -> None:
         """
