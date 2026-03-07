@@ -9,14 +9,13 @@
 **FusionGP** is a scalable probabilistic framework for fusing heterogeneous NO₂ observations into a unified spatio-temporal field using Sparse Variational Gaussian Processes (SVGPs). The framework integrates:
 
 - **EPA Regulatory Monitors**: High-accuracy reference measurements (sparse spatial coverage)
-- **Low-Cost Sensors**: Dense spatial coverage with potential bias and drift
-- **Satellite Retrievals**: Broad spatial coverage with coarser resolution
+- **Satellite Retrievals**: Broad spatial coverage with coarser resolution (TROPOMI)
+- **LUR Prior Mean**: Land-use regression baseline as the GP mean function
 
 ### Key Features
 
 - **Single Latent Field**: One GP models the true NO₂ concentration; all sources observe it through source-specific likelihoods
-- **Automatic Bias Correction**: Learns linear calibration (slope `a`, intercept `b`) for low-cost sensors
-- **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_LC, σ²_SAT)
+- **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_SAT)
 - **Scalable Inference**: SVGP with inducing points enables O(NM²) complexity instead of O(N³)
 - **Uncertainty Quantification**: Full predictive distributions with calibrated uncertainty
 - **LUR Prior Mean**: Optional land-use regression (LUR) prior provides a spatial baseline
@@ -67,7 +66,7 @@ flowchart TD
 
 Let `f(s,t)` denote the true latent NO₂ concentration at location `s=(x,y)` and time `t`.
 
-Each source `q ∈ {EPA, LC, SAT}` produces observations:
+Each source `q ∈ {EPA, SAT}` produces observations:
 
 ```
 y_i^(q) = h_q(f(s_i, t_i)) + ε_i^(q),  ε_i^(q) ~ N(0, σ_q²)
@@ -75,7 +74,6 @@ y_i^(q) = h_q(f(s_i, t_i)) + ε_i^(q),  ε_i^(q) ~ N(0, σ_q²)
 
 Where the link functions are:
 - **EPA**: `h_EPA(f) = f` (unbiased reference)
-- **Low-Cost**: `h_LC(f) = a·f + b` (linear calibration)
 - **Satellite**: `h_SAT(f) = f` (unbiased but higher noise)
 
 ### GP Prior
@@ -260,7 +258,7 @@ FusionGP computes comprehensive metrics for probabilistic model evaluation:
 - **Energy Score**: Multivariate probabilistic metric
 
 ### Per-Source Metrics
-All metrics computed separately for EPA, Low-Cost, and Satellite observations.
+All metrics computed separately for EPA and Satellite observations.
 
 ## Configuration
 
