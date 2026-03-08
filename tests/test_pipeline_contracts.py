@@ -599,7 +599,75 @@ class TestGPKFTimestampContract:
 
 
 # ===========================================================================
-# 8. End-to-end smoke test
+# 8. Training history CSV building (regression for IndexError with short val_loss)
+# ===========================================================================
+
+class TestTrainingHistoryCSV:
+    """
+    Regression tests for the training-history CSV row building logic in
+    run_demo_pipeline.py.  The bug: val_loss list may be shorter than
+    train_loss (e.g. validation runs every N epochs) causing IndexError.
+    """
+
+    def _build_rows(self, history_dict):
+        """Mirror the fixed logic from run_demo_pipeline.py."""
+        val_losses = history_dict.get("val_loss", [])
+        rows = []
+        for epoch_idx, tl in enumerate(history_dict.get("train_loss", [])):
+            rows.append({
+                "epoch": epoch_idx,
+                "train_loss": tl,
+                "val_loss": val_losses[epoch_idx] if epoch_idx < len(val_losses) else None,
+            })
+        return rows
+
+    def test_equal_length_lists(self):
+        history = {"train_loss": [2.0, 1.5, 1.0], "val_loss": [2.1, 1.6, 1.1]}
+        rows = self._build_rows(history)
+        assert len(rows) == 3
+        assert rows[2]["val_loss"] == pytest.approx(1.1)
+
+    def test_val_loss_shorter_than_train_loss(self):
+        """val_loss runs every 10 epochs — list is much shorter than train_loss."""
+        history = {"train_loss": list(range(30)), "val_loss": [99.0, 88.0, 77.0]}
+        rows = self._build_rows(history)
+        assert len(rows) == 30
+        assert rows[0]["val_loss"] == pytest.approx(99.0)
+        assert rows[1]["val_loss"] == pytest.approx(88.0)
+        assert rows[2]["val_loss"] == pytest.approx(77.0)
+        # Epochs beyond val_loss length should get None, not IndexError
+        assert rows[3]["val_loss"] is None
+        assert rows[29]["val_loss"] is None
+
+    def test_empty_val_loss(self):
+        """No validation at all — val_loss key absent."""
+        history = {"train_loss": [2.0, 1.5]}
+        rows = self._build_rows(history)
+        assert len(rows) == 2
+        assert all(r["val_loss"] is None for r in rows)
+
+    def test_empty_train_loss(self):
+        history = {"train_loss": [], "val_loss": []}
+        rows = self._build_rows(history)
+        assert rows == []
+
+    def test_csv_roundtrip(self, tmp_path):
+        """Rows survive a pd.DataFrame → CSV → read_csv roundtrip."""
+        history = {"train_loss": [2.0, 1.5, 1.0], "val_loss": [2.1]}
+        rows = self._build_rows(history)
+        path = tmp_path / "training_history.csv"
+        pd.DataFrame(rows).to_csv(path, index=False)
+        df = pd.read_csv(path)
+        assert len(df) == 3
+        assert df["epoch"].tolist() == [0, 1, 2]
+        assert df["train_loss"].tolist() == pytest.approx([2.0, 1.5, 1.0])
+        # val_loss rows 1 and 2 should be NaN (read back as float NaN)
+        assert pd.isna(df.loc[1, "val_loss"])
+        assert pd.isna(df.loc[2, "val_loss"])
+
+
+# ===========================================================================
+# 9. End-to-end smoke test
 # ===========================================================================
 
 class TestEndToEndSmoke:

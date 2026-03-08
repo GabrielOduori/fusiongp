@@ -62,9 +62,14 @@ flowchart TD
 
 ## Maps and Visualisations
 
-After the pipeline has run, all figures can be regenerated at any time without re-running the full pipeline:
+The pipeline (`run_demo_pipeline.py`) **only saves CSVs** — it produces no figures.
+All figures are generated separately by running:
 
 ```bash
+# Step 1: run the pipeline (saves CSVs to outputs/demo_run_<timestamp>/)
+python experiments/run_demo_pipeline.py
+
+# Step 2: generate all figures from those CSVs
 # Uses the most recent outputs/demo_run_* automatically
 python experiments/generate_figures.py
 
@@ -172,6 +177,31 @@ To use a different data directory:
 ```bash
 python experiments/run_demo_pipeline.py --data-dir /path/to/your/data
 ```
+
+### Resuming a crashed run
+
+If the pipeline crashes (e.g. out of disk space, killed process), you can resume from where it left off without retraining:
+
+```bash
+# Auto-detect the most recent run directory
+python experiments/run_demo_pipeline.py --resume
+
+# Or point to a specific run directory
+python experiments/run_demo_pipeline.py --resume outputs/demo_run_20240601_120000
+
+# Resume also works with --data-dir if your data is not in the default location
+python experiments/run_demo_pipeline.py --resume --data-dir /path/to/your/data
+```
+
+The pipeline checks for existing outputs and skips completed steps:
+
+| Output present | Step skipped |
+|---|---|
+| `checkpoints/best_model.pt` | Model training — checkpoint is loaded instead |
+| `kalman_maps/kalman_day_*.csv` | Kalman smoother |
+| `gpkf_maps/gpkf_day_*.csv` | GP-Kalman Filter |
+
+Data loading, preprocessing, SVGP prediction, and evaluation always re-run (they are fast and depend on the loaded model).
 
 ### Verifying your setup
 
