@@ -522,6 +522,24 @@ def _run_rq2_sweep(sweep_values: list[int], base_run_tag: str, data_dir: Path) -
         tqdm.write(f"Sweep report generation failed: {e}\n{traceback.format_exc()}")
 
 
+_RESUME_LATEST = Path("__latest__")  # sentinel: --resume with no argument
+
+
+def _find_latest_run_dir() -> Path:
+    """Return the most recently modified outputs/demo_run_* directory."""
+    candidates = sorted(
+        (PROJECT_ROOT / "outputs").glob("demo_run_*"),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True,
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            "No outputs/demo_run_* directories found. "
+            "Run the pipeline at least once before using --resume."
+        )
+    return candidates[0]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FusionGP end-to-end pipeline")
     parser.add_argument(
@@ -552,6 +570,15 @@ def main() -> None:
     parser.add_argument(
         "--data-only", action="store_true",
         help="Build merged dataset and export UQ CSVs only; skip training and prediction",
+    )
+    parser.add_argument(
+        "--resume",
+        type=Path,
+        nargs="?",
+        const=_RESUME_LATEST,  # --resume with no argument → auto-detect latest
+        default=None,
+        metavar="RUN_DIR",
+        help="Resume a previous run. Omit RUN_DIR to auto-detect the latest outputs/demo_run_* directory.",
     )
     args = parser.parse_args()
 
@@ -584,8 +611,18 @@ def main() -> None:
     np.random.seed(42)
     torch.manual_seed(42)
 
-    run_tag = os.getenv("RUN_TAG") or datetime.now().strftime('%Y%m%d_%H%M%S')
-    run_dir = PROJECT_ROOT / "outputs" / f"demo_run_{run_tag}"
+    if args.resume is not None:
+        if args.resume == _RESUME_LATEST:
+            run_dir = _find_latest_run_dir()
+            tqdm.write(f"Auto-detected latest run: {run_dir}")
+        else:
+            run_dir = args.resume.resolve()
+            if not run_dir.exists():
+                raise FileNotFoundError(f"Resume directory not found: {run_dir}")
+        tqdm.write(f"Resuming from existing run: {run_dir}")
+    else:
+        run_tag = os.getenv("RUN_TAG") or datetime.now().strftime('%Y%m%d_%H%M%S')
+        run_dir = PROJECT_ROOT / "outputs" / f"demo_run_{run_tag}"
     run_dir.mkdir(parents=True, exist_ok=True)
     fig_dir = run_dir / "figures"
     fig_dir.mkdir(parents=True, exist_ok=True)
@@ -643,6 +680,8 @@ def main() -> None:
                 "latitude":  "latitude",
                 "longitude": "longitude",
                 "timestamp": "timestamp",
+                "traffic":   "__disabled__",   # traffic_volume is a covariate, not an NO₂ source
+                "low_cost":  "__disabled__",
                 **{src: cfg["column"] for src, cfg in SOURCE_CONFIG.items()},
             },
             covariate_columns=covariate_columns,
@@ -710,7 +749,7 @@ def main() -> None:
                 preprocessor.get_scalers(),
                 covariate_columns=covariate_columns,
                 data_path_for_lur=merged_path,
-                add_lur_as_source=True,
+                add_lur_as_source=False,  # LUR is the GP prior mean — don't add as likelihood observations
             )
             export_uq_dataset(
                 val_data,
@@ -718,7 +757,7 @@ def main() -> None:
                 preprocessor.get_scalers(),
                 covariate_columns=covariate_columns,
                 data_path_for_lur=merged_path,
-                add_lur_as_source=True,
+                add_lur_as_source=True,   # LUR rows kept as spatial query points for prediction
             )
             export_uq_dataset(
                 test_data,
@@ -726,7 +765,7 @@ def main() -> None:
                 preprocessor.get_scalers(),
                 covariate_columns=covariate_columns,
                 data_path_for_lur=merged_path,
-                add_lur_as_source=True,
+                add_lur_as_source=True,   # LUR rows kept as spatial query points for prediction
             )
             tqdm.write(f"Saved UQ exports to: {uq_dir}")
         except Exception as e:
@@ -801,21 +840,34 @@ def main() -> None:
             device="cpu",
         )
 
-        # Train (time the training step)
-        train_start = time.time()
-        history = trainer.fit(train_data, val_data, verbose=True)
-        train_seconds = time.time() - train_start
-        tqdm.write(f"Training time: {train_seconds/60:.2f} minutes")
+        # Train (time the training step) — skip if a checkpoint already exists
+        checkpoint_path = run_dir / "checkpoints" / "best_model.pt"
+        if checkpoint_path.exists():
+            tqdm.write(f"Checkpoint found — loading model, skipping training: {checkpoint_path}")
+            ckpt = torch.load(checkpoint_path, map_location="cpu")
+            # Checkpoint is a dict saved by ModelCheckpoint callback
+            model.load_state_dict(ckpt["model_state_dict"])
+            if "likelihood_state_dict" in ckpt:
+                model.likelihood.load_state_dict(ckpt["likelihood_state_dict"])
+            model.eval()
+            train_seconds = 0.0
+            history_dict = {}
+        else:
+            train_start = time.time()
+            history = trainer.fit(train_data, val_data, verbose=True)
+            train_seconds = time.time() - train_start
+            tqdm.write(f"Training time: {train_seconds/60:.2f} minutes")
+            history_dict = history.to_dict()
         pbar.update(1)
 
-        # Save training history for later plotting
-        history_dict = history.to_dict()
+        # Save training history for later plotting (only when we actually trained)
+        val_losses = history_dict.get("val_loss", [])
         hist_rows = []
         for epoch_idx, tl in enumerate(history_dict.get("train_loss", [])):
             hist_rows.append({
                 "epoch": epoch_idx,
                 "train_loss": tl,
-                "val_loss": history_dict.get("val_loss", [None] * (epoch_idx + 1))[epoch_idx],
+                "val_loss": val_losses[epoch_idx] if epoch_idx < len(val_losses) else None,
             })
         if hist_rows:
             pd.DataFrame(hist_rows).to_csv(run_dir / "training_history.csv", index=False)
@@ -874,131 +926,137 @@ def main() -> None:
         unique_days = np.unique(data.timestamps)
 
         # Kalman smoother — day-by-day spatio-temporal tracking
-        try:
-            from src.inference.kalman_smoother import KalmanSmoother
-            tqdm.write("\nRunning Kalman smoother for day-by-day tracking...")
-            smoother = KalmanSmoother(
-                model=model,
-                predictor=predictor,
-                scalers=preprocessor.get_scalers(),
-                run_backward_smoother=True,
-                batch_size=1024,
-            )
-            smoothed = smoother.smooth(
-                coords_original=grid_coords,
-                unique_days=unique_days,
-            )
-            kalman_dir = run_dir / "kalman_maps"
-            kalman_dir.mkdir(parents=True, exist_ok=True)
-            for d_idx, day_val in enumerate(unique_days):
-                pd.DataFrame({
-                    "latitude": smoothed.coords[:, 0],
-                    "longitude": smoothed.coords[:, 1],
-                    "mean_ug_m3": smoothed.mean_ug[:, d_idx],
-                    "std_ug_m3": smoothed.std_ug[:, d_idx],
-                    "svgp_mean_ug_m3": smoothed.svgp_mean_ug[:, d_idx],
-                    "svgp_std_ug_m3": smoothed.svgp_std_ug[:, d_idx],
-                    "day": day_val,
-                }).to_csv(kalman_dir / f"kalman_day_{d_idx:02d}.csv", index=False)
-            tqdm.write(f"Kalman maps saved to {kalman_dir}  ({len(unique_days)} days)")
-        except Exception as e:
-            tqdm.write(f"Kalman smoother failed: {e}")
+        if any((run_dir / "kalman_maps").glob("kalman_day_*.csv")):
+            tqdm.write("Kalman maps already exist — skipping Kalman smoother.")
+        else:
+            try:
+                from src.inference.kalman_smoother import KalmanSmoother
+                tqdm.write("\nRunning Kalman smoother for day-by-day tracking...")
+                smoother = KalmanSmoother(
+                    model=model,
+                    predictor=predictor,
+                    scalers=preprocessor.get_scalers(),
+                    run_backward_smoother=True,
+                    batch_size=1024,
+                )
+                smoothed = smoother.smooth(
+                    coords_original=grid_coords,
+                    unique_days=unique_days,
+                )
+                kalman_dir = run_dir / "kalman_maps"
+                kalman_dir.mkdir(parents=True, exist_ok=True)
+                for d_idx, day_val in enumerate(unique_days):
+                    pd.DataFrame({
+                        "latitude": smoothed.coords[:, 0],
+                        "longitude": smoothed.coords[:, 1],
+                        "mean_ug_m3": smoothed.mean_ug[:, d_idx],
+                        "std_ug_m3": smoothed.std_ug[:, d_idx],
+                        "svgp_mean_ug_m3": smoothed.svgp_mean_ug[:, d_idx],
+                        "svgp_std_ug_m3": smoothed.svgp_std_ug[:, d_idx],
+                        "day": day_val,
+                    }).to_csv(kalman_dir / f"kalman_day_{d_idx:02d}.csv", index=False)
+                tqdm.write(f"Kalman maps saved to {kalman_dir}  ({len(unique_days)} days)")
+            except Exception as e:
+                tqdm.write(f"Kalman smoother failed: {e}")
         pbar.update(1)
 
         # GP-Kalman Filter — proper sequential fusion (LUR prior + daily obs updates)
         gpkf_seq_preds = None
         gpkf_epa_test_days_raw = None
         gpkf_unique_days = None
-        try:
-            from src.inference.gp_kalman_filter import GPKalmanFilter
-            tqdm.write("\nRunning GP-Kalman Filter (sequential fusion from LUR prior)...")
-            _scalers = preprocessor.get_scalers()
-
-            # Convert covariate_df timestamps to numeric (days since first observation)
-            # to match the scale used by DataLoader._convert_timestamps.
-            df_cov = df.copy()
-            _ts_dt = pd.to_datetime(df_cov["timestamp"], errors="coerce")
-            df_cov["timestamp"] = (
-                (_ts_dt - _ts_dt.min()).dt.total_seconds() / 86400.0
-            )
-
-            gpkf = GPKalmanFilter(
-                model, _scalers,
-                covariate_df=df_cov,
-                covariate_cols=covariate_columns,
-                train_data=train_data,
-            )
-            del df_cov  # free the copy after the cache is built inside GPKalmanFilter.__init__
-
-            # Build the non-test dataset for the GPKF.
-            # The GPKF gets all train + val observations (EPA + satellite) — only
-            # the 15% test split is withheld for evaluation.
-            #
-            # Coordinates must stay in RAW (lat/lon degrees) — the filter normalises
-            # them internally with scalers.coord_min / coord_scale.
-            # Observations must be in NORMALISED space to match the Kalman state.
-            # Using preprocessor.transform() would also normalise coords to [0,1],
-            # which would cause double-normalisation inside the filter (H ≈ 0).
-            non_test_idx = np.concatenate([
-                preprocessor.train_indices_,
-                preprocessor.val_indices_,
-            ])
-            norm_non_test = preprocessor._subset_data(data, non_test_idx)
-            # Normalise only the observations (coords and timestamps stay raw)
-            for _src in list(norm_non_test.observations.keys()):
-                if _scalers.normalize_targets and _src in _scalers.target_mean:
-                    norm_non_test.observations[_src] = (
-                        (norm_non_test.observations[_src] - _scalers.target_mean[_src])
-                        / _scalers.target_std[_src]
-                    )
-
-            # GPKF filter expects timestamps in raw day scale (0, 1, 2, ..., N_DAYS-1),
-            # NOT normalised [0, 1]. Use raw_timestamps and convert to days since first obs.
-            _raw_ts = pd.to_datetime(norm_non_test.raw_timestamps, errors="coerce")
-            _global_min_ts = pd.to_datetime(data.raw_timestamps, errors="coerce").min()
-            _raw_ts_days = (_raw_ts - _global_min_ts).total_seconds() / 86400.0
-            norm_non_test.timestamps[:] = _raw_ts_days.values
-            gpkf_unique_days = np.unique(_raw_ts_days.values)
-
-            # test_data coords and timestamps are normalised → denormalise to raw scale
-            epa_test_coords_raw = (
-                test_data.coords[test_mask] * _scalers.coord_scale + _scalers.coord_min
-            )
-            _raw_ts_test = pd.to_datetime(test_data.raw_timestamps[test_mask], errors="coerce")
-            gpkf_epa_test_days_raw = (
-                (_raw_ts_test - _global_min_ts).total_seconds() / 86400.0
-            )
-
-            gpkf_seq_preds = gpkf.filter(
-                norm_non_test, gpkf_unique_days, grid_coords,
-                eval_coords_original=epa_test_coords_raw,
-            )
-            gpkf_dir = run_dir / "gpkf_maps"
-            gpkf_dir.mkdir(parents=True, exist_ok=True)
-            for d_idx, day_val in enumerate(gpkf_unique_days):
-                pd.DataFrame({
-                    "grid_id": grid_ids,
-                    "latitude": gpkf_seq_preds.coords[:, 0],
-                    "longitude": gpkf_seq_preds.coords[:, 1],
-                    "mean_ug_m3": gpkf_seq_preds.mean_ug[:, d_idx],
-                    "std_ug_m3": gpkf_seq_preds.std_ug[:, d_idx],
-                    "n_obs": gpkf_seq_preds.n_obs_per_day[d_idx],
-                    "day": day_val,
-                }).to_csv(gpkf_dir / f"gpkf_day_{d_idx:02d}.csv", index=False)
-            tqdm.write(
-                f"GP-Kalman maps saved to {gpkf_dir}  ({len(gpkf_unique_days)} days)\n"
-                f"  Obs per day: min={gpkf_seq_preds.n_obs_per_day.min()}, "
-                f"max={gpkf_seq_preds.n_obs_per_day.max()}, "
-                f"mean={gpkf_seq_preds.n_obs_per_day.mean():.1f}"
-            )
-        except Exception as e:
-            import traceback
-            err_msg = f"GP-Kalman filter failed: {e}\n{traceback.format_exc()}"
-            tqdm.write(err_msg)
+        if any((run_dir / "gpkf_maps").glob("gpkf_day_*.csv")):
+            tqdm.write("GPKF maps already exist — skipping GP-Kalman Filter.")
+        else:
             try:
-                (run_dir / "gpkf_error.txt").write_text(err_msg)
-            except Exception:
-                pass
+                from src.inference.gp_kalman_filter import GPKalmanFilter
+                tqdm.write("\nRunning GP-Kalman Filter (sequential fusion from LUR prior)...")
+                _scalers = preprocessor.get_scalers()
+
+                # Convert covariate_df timestamps to numeric (days since first observation)
+                # to match the scale used by DataLoader._convert_timestamps.
+                df_cov = df.copy()
+                _ts_dt = pd.to_datetime(df_cov["timestamp"], errors="coerce")
+                df_cov["timestamp"] = (
+                    (_ts_dt - _ts_dt.min()).dt.total_seconds() / 86400.0
+                )
+
+                gpkf = GPKalmanFilter(
+                    model, _scalers,
+                    covariate_df=df_cov,
+                    covariate_cols=covariate_columns,
+                    train_data=train_data,
+                )
+                del df_cov  # free the copy after the cache is built inside GPKalmanFilter.__init__
+
+                # Build the non-test dataset for the GPKF.
+                # The GPKF gets all train + val observations (EPA + satellite) — only
+                # the 15% test split is withheld for evaluation.
+                #
+                # Coordinates must stay in RAW (lat/lon degrees) — the filter normalises
+                # them internally with scalers.coord_min / coord_scale.
+                # Observations must be in NORMALISED space to match the Kalman state.
+                # Using preprocessor.transform() would also normalise coords to [0,1],
+                # which would cause double-normalisation inside the filter (H ≈ 0).
+                non_test_idx = np.concatenate([
+                    preprocessor.train_indices_,
+                    preprocessor.val_indices_,
+                ])
+                norm_non_test = preprocessor._subset_data(data, non_test_idx)
+                # Normalise only the observations (coords and timestamps stay raw)
+                for _src in list(norm_non_test.observations.keys()):
+                    if _scalers.normalize_targets and _src in _scalers.target_mean:
+                        norm_non_test.observations[_src] = (
+                            (norm_non_test.observations[_src] - _scalers.target_mean[_src])
+                            / _scalers.target_std[_src]
+                        )
+
+                # GPKF filter expects timestamps in raw day scale (0, 1, 2, ..., N_DAYS-1),
+                # NOT normalised [0, 1]. Use raw_timestamps and convert to days since first obs.
+                _raw_ts = pd.to_datetime(norm_non_test.raw_timestamps, errors="coerce")
+                _global_min_ts = pd.to_datetime(data.raw_timestamps, errors="coerce").min()
+                _raw_ts_days = (_raw_ts - _global_min_ts).total_seconds() / 86400.0
+                norm_non_test.timestamps[:] = _raw_ts_days.values
+                gpkf_unique_days = np.unique(_raw_ts_days.values)
+
+                # test_data coords and timestamps are normalised → denormalise to raw scale
+                epa_test_coords_raw = (
+                    test_data.coords[test_mask] * _scalers.coord_scale + _scalers.coord_min
+                )
+                _raw_ts_test = pd.to_datetime(test_data.raw_timestamps[test_mask], errors="coerce")
+                gpkf_epa_test_days_raw = (
+                    (_raw_ts_test - _global_min_ts).total_seconds() / 86400.0
+                )
+
+                gpkf_seq_preds = gpkf.filter(
+                    norm_non_test, gpkf_unique_days, grid_coords,
+                    eval_coords_original=epa_test_coords_raw,
+                )
+                gpkf_dir = run_dir / "gpkf_maps"
+                gpkf_dir.mkdir(parents=True, exist_ok=True)
+                for d_idx, day_val in enumerate(gpkf_unique_days):
+                    pd.DataFrame({
+                        "grid_id": grid_ids,
+                        "latitude": gpkf_seq_preds.coords[:, 0],
+                        "longitude": gpkf_seq_preds.coords[:, 1],
+                        "mean_ug_m3": gpkf_seq_preds.mean_ug[:, d_idx],
+                        "std_ug_m3": gpkf_seq_preds.std_ug[:, d_idx],
+                        "n_obs": gpkf_seq_preds.n_obs_per_day[d_idx],
+                        "day": day_val,
+                    }).to_csv(gpkf_dir / f"gpkf_day_{d_idx:02d}.csv", index=False)
+                tqdm.write(
+                    f"GP-Kalman maps saved to {gpkf_dir}  ({len(gpkf_unique_days)} days)\n"
+                    f"  Obs per day: min={gpkf_seq_preds.n_obs_per_day.min()}, "
+                    f"max={gpkf_seq_preds.n_obs_per_day.max()}, "
+                    f"mean={gpkf_seq_preds.n_obs_per_day.mean():.1f}"
+                )
+            except Exception as e:
+                import traceback
+                err_msg = f"GP-Kalman filter failed: {e}\n{traceback.format_exc()}"
+                tqdm.write(err_msg)
+                try:
+                    (run_dir / "gpkf_error.txt").write_text(err_msg)
+                except Exception:
+                    pass
 
         # Baseline maps (LUR + ATMO-Plan) and fusion map
         map_dir = run_dir / "map_data"
