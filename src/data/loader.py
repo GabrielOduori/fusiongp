@@ -51,7 +51,7 @@ class FusionData:
         Temporal indices array of shape (N,) containing timestamp values
         (converted to numerical representation).
     observations : Dict[str, np.ndarray]
-        Dictionary mapping source names ('epa', 'low_cost', 'satellite') to
+        Dictionary mapping source names ('epa', 'satellite') to
         observation arrays of shape (N,). NaN indicates missing observations.
     source_masks : Dict[str, np.ndarray]
         Dictionary mapping source names to boolean masks of shape (N,) indicating
@@ -70,8 +70,8 @@ class FusionData:
     >>> data = FusionData(
     ...     coords=np.array([[40.7, -74.0], [40.8, -74.1]]),
     ...     timestamps=np.array([0.0, 1.0]),
-    ...     observations={'epa': np.array([10.5, np.nan]), 'low_cost': np.array([12.0, 11.0])},
-    ...     source_masks={'epa': np.array([True, False]), 'low_cost': np.array([True, True])},
+    ...     observations={'epa': np.array([10.5, np.nan]), 'satellite': np.array([12.0, 11.0])},
+    ...     source_masks={'epa': np.array([True, False]), 'satellite': np.array([True, True])},
     ...     grid_ids=np.array([1, 2]),
     ...     raw_timestamps=np.array(['2024-01-01', '2024-01-02']),
     ...     metadata={'n_grid_cells': 100}
@@ -115,7 +115,7 @@ class FusionData:
         Parameters
         ----------
         source : str
-            Source name ('epa', 'low_cost', or 'satellite').
+            Source name ('epa' or 'satellite').
             
         Returns
         -------
@@ -172,7 +172,7 @@ class DataLoader:
         - 'longitude': 'longitude'
         - 'timestamp': 'timestamp'
         - 'satellite': 'satellite_values'
-        - 'low_cost': 'low_cost_data'
+        - 'low_cost': 'low_cost_data'  (optional — not used in current dataset)
         - 'epa': 'epa_no2'
         - 'traffic': 'traffic_volume'
     
@@ -553,7 +553,7 @@ class FusionDataset(Dataset):
         
     Example
     -------
-    >>> dataset = FusionDataset(data, sources=['epa', 'low_cost', 'satellite'])
+    >>> dataset = FusionDataset(data, sources=['epa', 'satellite'])
     >>> loader = torch.utils.data.DataLoader(dataset, batch_size=1024, shuffle=True)
     >>> for batch in loader:
     ...     coords, timestamps, obs, masks, indices, covariates = batch

@@ -9,14 +9,13 @@
 **FusionGP** is a scalable probabilistic framework for fusing heterogeneous NO₂ observations into a unified spatio-temporal field using Sparse Variational Gaussian Processes (SVGPs). The framework integrates:
 
 - **EPA Regulatory Monitors**: High-accuracy reference measurements (sparse spatial coverage)
-- **Low-Cost Sensors**: Dense spatial coverage with potential bias and drift
-- **Satellite Retrievals**: Broad spatial coverage with coarser resolution
+- **Satellite Retrievals**: Broad spatial coverage with coarser resolution (TROPOMI)
+- **LUR Prior Mean**: Land-use regression baseline as the GP mean function
 
 ### Key Features
 
 - **Single Latent Field**: One GP models the true NO₂ concentration; all sources observe it through source-specific likelihoods
-- **Automatic Bias Correction**: Learns linear calibration (slope `a`, intercept `b`) for low-cost sensors
-- **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_LC, σ²_SAT)
+- **Heteroscedastic Noise**: Source-specific noise variances (σ²_EPA, σ²_SAT)
 - **Scalable Inference**: SVGP with inducing points enables O(NM²) complexity instead of O(N³)
 - **Uncertainty Quantification**: Full predictive distributions with calibrated uncertainty
 - **LUR Prior Mean**: Optional land-use regression (LUR) prior provides a spatial baseline
@@ -61,13 +60,50 @@ flowchart TD
   J --> K
 ```
 
+## Maps and Visualisations
+
+The pipeline (`run_demo_pipeline.py`) **only saves CSVs** — it produces no figures.
+All figures are generated separately by running:
+
+```bash
+# Step 1: run the pipeline (saves CSVs to outputs/demo_run_<timestamp>/)
+python experiments/run_demo_pipeline.py
+
+# Step 2: generate all figures from those CSVs
+# Uses the most recent outputs/demo_run_* automatically
+python experiments/generate_figures.py
+
+# Or point to a specific run directory
+python experiments/generate_figures.py outputs/demo_run_20240601_120000
+```
+
+This reads the CSVs saved by the pipeline and produces all figures inside `<run_dir>/publication_maps/`:
+
+| Sub-directory | Contents |
+|---|---|
+| `gpkf/` | Per-day GPKF mean + uncertainty side-by-side maps |
+| `svgp/` | Per-day SVGP fusion mean + uncertainty maps |
+| `baselines/` | LUR and Atmo-Plan static baseline maps |
+| `timeseries/` | Domain-averaged NO₂ over time; EPA observed vs SVGP predicted |
+| `diagnostics/` | Training loss curves; SVGP calibration + residuals; GPKF calibration |
+
+All spatial maps use Gaussian-smoothed heatmaps overlaid on a basemap with EPA station locations.
+
+**Optional:** For higher-quality basemap tiles, add a Stadia Maps API key to a `.env` file at the project root:
+
+```
+STADIA_API_KEY=your_key_here
+```
+
+Without a key, it falls back to CartoDB Positron tiles.
+
 ## Mathematical Formulation
 
 ### Generative Model
 
 Let `f(s,t)` denote the true latent NO₂ concentration at location `s=(x,y)` and time `t`.
 
-Each source `q ∈ {EPA, LC, SAT}` produces observations:
+Each source `q ∈ {EPA, SAT}` produces observations:
 
 ```
 y_i^(q) = h_q(f(s_i, t_i)) + ε_i^(q),  ε_i^(q) ~ N(0, σ_q²)
@@ -75,7 +111,6 @@ y_i^(q) = h_q(f(s_i, t_i)) + ε_i^(q),  ε_i^(q) ~ N(0, σ_q²)
 
 Where the link functions are:
 - **EPA**: `h_EPA(f) = f` (unbiased reference)
-- **Low-Cost**: `h_LC(f) = a·f + b` (linear calibration)
 - **Satellite**: `h_SAT(f) = f` (unbiased but higher noise)
 
 ### GP Prior
@@ -142,6 +177,31 @@ To use a different data directory:
 ```bash
 python experiments/run_demo_pipeline.py --data-dir /path/to/your/data
 ```
+
+### Resuming a crashed run
+
+If the pipeline crashes (e.g. out of disk space, killed process), you can resume from where it left off without retraining:
+
+```bash
+# Auto-detect the most recent run directory
+python experiments/run_demo_pipeline.py --resume
+
+# Or point to a specific run directory
+python experiments/run_demo_pipeline.py --resume outputs/demo_run_20240601_120000
+
+# Resume also works with --data-dir if your data is not in the default location
+python experiments/run_demo_pipeline.py --resume --data-dir /path/to/your/data
+```
+
+The pipeline checks for existing outputs and skips completed steps:
+
+| Output present | Step skipped |
+|---|---|
+| `checkpoints/best_model.pt` | Model training — checkpoint is loaded instead |
+| `kalman_maps/kalman_day_*.csv` | Kalman smoother |
+| `gpkf_maps/gpkf_day_*.csv` | GP-Kalman Filter |
+
+Data loading, preprocessing, SVGP prediction, and evaluation always re-run (they are fast and depend on the loaded model).
 
 ### Verifying your setup
 
@@ -260,7 +320,7 @@ FusionGP computes comprehensive metrics for probabilistic model evaluation:
 - **Energy Score**: Multivariate probabilistic metric
 
 ### Per-Source Metrics
-All metrics computed separately for EPA, Low-Cost, and Satellite observations.
+All metrics computed separately for EPA and Satellite observations.
 
 ## Configuration
 

@@ -82,13 +82,15 @@ MAX_ANALYSIS_GRID_POINTS = 5_000_000
 
 
 def build_multi_case_definitions():
-    """Return case definitions for multi-case evaluation."""
+    """Return case definitions for multi-case evaluation.
+
+    Sources available: EPA monitors, satellite (TROPOMI), and LUR prior mean.
+    """
     return [
         {"name": "Case 0 (EPA only)", "sources": ["epa"], "mode": "train", "use_prior": False},
-        {"name": "Case 1 (Prior only)", "sources": [], "mode": "prior_only", "use_prior": True},
-        {"name": "Case 2 (Prior + Satellite)", "sources": ["satellite"], "mode": "train", "use_prior": True},
-        {"name": "Case 3 (Prior + LCS)", "sources": ["low_cost"], "mode": "train", "use_prior": True},
-        {"name": "Case 4 (Prior + LCS + Satellite)", "sources": ["low_cost", "satellite"], "mode": "train", "use_prior": True},
+        {"name": "Case 1 (LUR prior only)", "sources": [], "mode": "prior_only", "use_prior": True},
+        {"name": "Case 2 (LUR prior + Satellite)", "sources": ["satellite"], "mode": "train", "use_prior": True},
+        {"name": "Case 3 (LUR prior + EPA + Satellite)", "sources": ["epa", "satellite"], "mode": "train", "use_prior": True},
     ]
 
 USE_EPA_HOLDOUT = True
