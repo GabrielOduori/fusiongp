@@ -19,7 +19,8 @@ __pycache__/
 *.egg-info/
 dist/
 build/
-*.csv
+data/satellite_retreavals_75.csv
+data/FusionData_daily_merged.csv
 
 docs/
 
