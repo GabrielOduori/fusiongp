@@ -34,7 +34,7 @@ from tqdm import tqdm
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.data import DataLoader, DataPreprocessor, AnalysisGrid
-from src.models import FusionSVGP, MultiTaskSVGP, ATMOPlanMean, GridPriorMean
+from src.models import FusionSVGP, GridPriorMean
 from src.training import Trainer
 from src.training.callbacks import EarlyStopping
 from src.inference import Predictor
@@ -48,7 +48,25 @@ from src.visualization.spatial_maps import create_spatial_maps
 # =============================================================================
 
 # Use the vetted real dataset (no synthetic/low-cost inputs) to avoid data leakage.
-DATA_PATH = Path("/media/gabriel-oduori/SERVER/dev_space/FusionGP/data_test/FusionData.csv")
+# Sources arrive as separate per-source files (EPA, satellite, traffic, ...) under
+# USE_DATA_DIR; build_daily_dataset_from_sources() merges them by grid_id + date.
+USE_DATA_DIR = Path("/media/gabriel-oduori/SERVER/dev_space/FusionGP/data/model_data")
+DATA_PATH = USE_DATA_DIR / "FusionData_daily_merged.csv"
+USE_INDIVIDUAL_SOURCES = True  # Use separate source files and merge by grid_id + day
+TRAFFIC_PATH = DATA_PATH.with_name("traffic_timeseries.csv")
+LUR_PATH = DATA_PATH.with_name("lur_predictions.csv")
+WIND_SECTOR_PATH = USE_DATA_DIR / "wind_sector_features_era5land_2023-06_daily.csv"
+
+# Overpass window: hours (inclusive) over which EPA and traffic readings are
+# averaged before entering the model, matching the satellite overpass period.
+# The actual UTC hour of a sun-synchronous satellite's overpass (e.g. TROPOMI)
+# depends on longitude/orbit track and the timezone of the timestamp columns,
+# so it is NOT a universal constant — it's inferred per run from the actual
+# hour distribution of satellite retrievals (see _infer_overpass_window), with
+# OVERPASS_WINDOW_PAD_HOURS as a margin for robustness over single-hour
+# matching. Set OVERPASS_WINDOW_OVERRIDE to force a fixed (start, end) instead.
+OVERPASS_WINDOW_PAD_HOURS = 1
+OVERPASS_WINDOW_OVERRIDE = None  # e.g. (11, 14) to bypass auto-detection
 
 COVARIATE_COLUMNS = []
 COVARIATE_DISTANCE_COLUMNS = []
@@ -81,26 +99,12 @@ GEOJSON_GRID_PATH = Path("/media/gabriel-oduori/SERVER/dev_space/data-tools/osm/
 MAX_ANALYSIS_GRID_POINTS = 5_000_000
 
 
-def build_multi_case_definitions():
-    """Return case definitions for multi-case evaluation.
-
-    Sources available: EPA monitors, satellite (TROPOMI), and LUR prior mean.
-    """
-    return [
-        {"name": "Case 0 (EPA only)", "sources": ["epa"], "mode": "train", "use_prior": False},
-        {"name": "Case 1 (LUR prior only)", "sources": [], "mode": "prior_only", "use_prior": True},
-        {"name": "Case 2 (LUR prior + Satellite)", "sources": ["satellite"], "mode": "train", "use_prior": True},
-        {"name": "Case 3 (LUR prior + EPA + Satellite)", "sources": ["epa", "satellite"], "mode": "train", "use_prior": True},
-    ]
-
 USE_EPA_HOLDOUT = True
 HOLDOUT_EPA_FRAC = 0.2
 HOLDOUT_EPA_BY_GRID = True
 HOLDOUT_SEED = 42
 
 USE_EPA_IN_TRAINING = False  # EPA is evaluation-only
-RUN_MULTI_CASE_EVALUATION = False
-USE_MULTITASK_MODEL = False  # Set to False to use FusionSVGP with ATMO-Plan prior
 PRIMARY_SOURCE = "epa"
 SATELLITE_KEEP_FRAC = 0.1
 HAS_SATELLITE = True
@@ -121,18 +125,14 @@ EPA_OUTLIER_CLEANED_SUFFIX = "_epa_cleaned"
 # Prior mean configuration
 # Option 1: Use GridPriorMean with CSV column (preferred for new datasets)
 USE_GRID_PRIOR = True  # Set True to use grid-based prior from CSV column
-GRID_PRIOR_COLUMN = "model_no2_10m"  # Column containing prior values (if using new data format)
+GRID_PRIOR_COLUMN = "predicted_no2"  # LUR fallback column (merged daily dataset)
 GRID_PRIOR_LEARNABLE_BIAS = False  # Fixed at 0 to preserve raw ATMOS-Plan baseline
-# USE_TROPOMI_PATTERN = False
-# TROPOMI_COLUMN = "satellite_no2"
-# TROPOMI_CALIBRATION_DAYS = 14
-# TROPOMI_RESTRICTED = True
-# AUGMENTED_PRIOR_COLUMN = "model_no2_10m_tropomi"
 
-# # Option 2: Use ATMOPlanMean with GeoTIFF (for test_data_updated.csv)
-# USE_ATMO_PLAN_PRIOR = False  # Use ATMO-Plan GeoTIFF as GP prior mean
-# ATMO_PLAN_PATH = Path(__file__).parent.parent / "data/atmo_plan_dublin.tif"
-# ATMO_PLAN_LEARNABLE_BIAS = True  # Learn bias correction for ATMO-Plan
+# ATMO-Plan as prior (preferred): read directly from its own CSV rather than
+# requiring model_no2_10m to be merged into the daily dataset.
+ATMO_PLAN_PATH = USE_DATA_DIR / "atmos_plan_model_no2.csv"
+ATMO_PLAN_AS_PRIOR = True
+ATMO_PLAN_PRIOR_COLUMN = "model_no2_10m"
 
 
 # =============================================================================
@@ -335,68 +335,6 @@ def downsample_source(data, source, keep_frac=1.0, seed=42):
     )
 
 
-def build_tropomi_pattern_prior(
-    df: pd.DataFrame,
-    model_col: str,
-    tropomi_col: str,
-    window_days: int = 14,
-    restricted: bool = True,
-    output_col: str = "model_no2_10m_tropomi",
-) -> pd.DataFrame:
-    """
-    Build a TROPOMI-augmented prior using a typical-pattern approach.
-
-    The pattern is computed over a calibration window and then added to the
-    model prior for all timestamps.
-    """
-    if model_col not in df.columns:
-        raise ValueError(f"Missing model prior column: {model_col}")
-    if tropomi_col not in df.columns:
-        raise ValueError(f"Missing TROPOMI column: {tropomi_col}")
-
-    ts = pd.to_datetime(df["timestamp"], errors="coerce", utc=True)
-    if ts.isna().all():
-        ts_num = pd.to_numeric(df["timestamp"], errors="coerce")
-        if ts_num.isna().all():
-            raise ValueError("Unable to parse timestamps for TROPOMI calibration window")
-        ts = pd.to_datetime(ts_num, unit="s", errors="coerce", utc=True)
-
-    start = ts.min()
-    end = start + pd.Timedelta(days=window_days)
-    calib_mask = (ts >= start) & (ts < end)
-
-    if restricted:
-        calib_mask = calib_mask & df[tropomi_col].notna()
-
-    if calib_mask.sum() == 0:
-        raise ValueError("No TROPOMI data available in calibration window")
-
-    calib = df.loc[calib_mask, ["grid_id", "latitude", "longitude", model_col, tropomi_col]].copy()
-
-    sat_mean = calib.groupby("grid_id", as_index=False)[tropomi_col].mean()
-    model_mean = calib.groupby("grid_id", as_index=False)[model_col].mean()
-
-    merged = pd.merge(sat_mean, model_mean, on="grid_id", how="inner")
-    merged = merged.dropna()
-    if len(merged) < 2:
-        slope, intercept = 1.0, 0.0
-    else:
-        x = merged[tropomi_col].values
-        y = merged[model_col].values
-        A = np.vstack([x, np.ones_like(x)]).T
-        slope, intercept = np.linalg.lstsq(A, y, rcond=None)[0]
-
-    merged["pattern"] = slope * merged[tropomi_col] + intercept - merged[model_col]
-    pattern_map = merged[["grid_id", "pattern"]]
-
-    df = df.copy()
-    df = df.merge(pattern_map, on="grid_id", how="left")
-    df["pattern"] = df["pattern"].fillna(0.0)
-    df[output_col] = df[model_col] + df["pattern"]
-    df.drop(columns=["pattern"], inplace=True)
-    return df
-
-
 def plot_epa_timeseries_by_site(
     data,
     predictions,
@@ -516,6 +454,163 @@ def load_geojson_grid_centroids(path: Path) -> pd.DataFrame:
     return pd.DataFrame.from_records(records)
 
 
+def _normalize_grid_id_series(series):
+    if series is None:
+        return series
+    # Grid IDs are string keys like "24_37"
+    s = series.astype("string").str.strip()
+    s = s.where(series.notna())
+    return s
+
+
+def _infer_overpass_window(hours: pd.Series, pad_hours: int = 1) -> tuple:
+    """
+    Infer the satellite overpass hour window from the actual hour distribution
+    of its retrieval timestamps, rather than assuming a fixed UTC window.
+
+    A sun-synchronous satellite's overpass UTC hour depends on the site's
+    longitude (and varies slightly day to day), so a hardcoded window from one
+    deployment (e.g. Dublin) would silently misalign on a different site or
+    timestamp timezone. We use the 1st-99th percentile of observed retrieval
+    hours (trimming rare stray timestamps) plus a small pad for robustness,
+    matching the "window mean over single-hour matching" rationale used here.
+    """
+    hours = pd.to_numeric(hours, errors="coerce").dropna()
+    if hours.empty:
+        raise ValueError("No satellite timestamps available to infer overpass window.")
+    lo = int(hours.quantile(0.01))
+    hi = int(hours.quantile(0.99))
+    start = max(0, lo - pad_hours)
+    end = min(23, hi + pad_hours)
+    return start, end
+
+
+def build_daily_dataset_from_sources(data_dir: Path) -> Path:
+    """
+    Build a daily-mean dataset by merging individual source files by grid_id + date.
+    """
+    required_files = {
+        "epa": data_dir / "epa_timeseries.csv",
+        "satellite": data_dir / "satellite_retreavals.csv",
+        "traffic": data_dir / "traffic_timeseries.csv",
+        "lur": data_dir / "lur_predictions.csv",
+        "grids": data_dir / "grids_coordinates.csv",
+        "wind": data_dir / "wind_sector_features_era5land_2023-06_daily.csv",
+    }
+    for name, path in required_files.items():
+        if name == "wind":
+            continue
+        if not path.exists():
+            raise FileNotFoundError(f"Missing {name} source file: {path}")
+
+    grids = pd.read_csv(required_files["grids"])
+    grids["grid_id"] = _normalize_grid_id_series(grids["grid_id"])
+    grids = grids.dropna(subset=["grid_id"])
+
+    # Satellite daily mean: use the raw TROPOMI column density (mol/m^2), not
+    # tropomi_no2_ug_m3. The ug/m3 column applies a surface-conversion equation
+    # we can't verify; gam_ssm_lur instead feeds the raw mol/m^2 retrieval
+    # straight into the model and lets calibration (learned here via
+    # learn_calibration / sat_slope/sat_intercept) absorb the unit/bias gap to
+    # EPA, rather than baking in an unverified conversion upstream.
+    sat = pd.read_csv(required_files["satellite"])
+    sat["grid_id"] = _normalize_grid_id_series(sat["grid_id"])
+    sat["timestamp"] = pd.to_datetime(sat["timestamp"], errors="coerce")
+    sat = sat.dropna(subset=["grid_id", "timestamp", "tropomi_no2"])
+    sat = sat[sat["tropomi_no2"] > 0]
+    sat["date"] = sat["timestamp"].dt.date
+    sat["hour"] = sat["timestamp"].dt.hour
+
+    if OVERPASS_WINDOW_OVERRIDE is not None:
+        overpass_start, overpass_end = OVERPASS_WINDOW_OVERRIDE
+    else:
+        overpass_start, overpass_end = _infer_overpass_window(
+            sat["hour"], pad_hours=OVERPASS_WINDOW_PAD_HOURS
+        )
+    print(f"   Overpass window (inferred from satellite retrievals): "
+          f"{overpass_start:02d}:00-{overpass_end:02d}:00")
+
+    sat = sat[(sat["hour"] >= overpass_start) & (sat["hour"] <= overpass_end)]
+    sat_daily = (
+        sat.groupby(["grid_id", "date"], as_index=False)
+        .agg({"tropomi_no2": "mean"})
+        .rename(columns={"tropomi_no2": "satellite_no2"})
+    )
+
+    # EPA overpass-window mean: restrict to the same hours the satellite
+    # overpasses occur in (inferred above) so EPA and satellite represent the
+    # same time-of-day before fusion.
+    epa = pd.read_csv(required_files["epa"])
+    epa["grid_id"] = _normalize_grid_id_series(epa["grid_id"])
+    epa["timestamp_utc"] = pd.to_datetime(epa["timestamp_utc"], errors="coerce")
+    epa = epa.dropna(subset=["grid_id", "timestamp_utc"])
+    epa["date"] = epa["timestamp_utc"].dt.date
+    epa["hour"] = epa["timestamp_utc"].dt.hour
+    epa = epa[(epa["hour"] >= overpass_start) & (epa["hour"] <= overpass_end)]
+    epa_daily = epa.groupby(["grid_id", "date"], as_index=False).agg({"epa_no2": "mean"})
+
+    # Traffic overpass-window mean: same window as EPA, for consistency.
+    traffic = pd.read_csv(required_files["traffic"])
+    traffic["grid_id"] = _normalize_grid_id_series(traffic["grid_id"])
+    traffic["traffic_end_time"] = pd.to_datetime(traffic["traffic_end_time"], errors="coerce")
+    traffic = traffic.dropna(subset=["grid_id", "traffic_end_time"])
+    traffic["date"] = traffic["traffic_end_time"].dt.date
+    traffic["hour"] = traffic["traffic_end_time"].dt.hour
+    traffic = traffic[(traffic["hour"] >= overpass_start) & (traffic["hour"] <= overpass_end)]
+    traffic_daily = (
+        traffic.groupby(["grid_id", "date"], as_index=False)
+        .agg({"traffic_volume": "mean"})
+    )
+
+    # Wind sector features (daily; time-varying)
+    wind_path = required_files["wind"]
+    if not wind_path.exists() and WIND_SECTOR_PATH.exists():
+        wind_path = WIND_SECTOR_PATH
+    wind_daily = None
+    if wind_path.exists():
+        wind = pd.read_csv(wind_path)
+        wind["grid_id"] = _normalize_grid_id_series(wind["grid_id"])
+        wind["date"] = pd.to_datetime(wind["date"], errors="coerce").dt.date
+        wind = wind.dropna(subset=["grid_id", "date"])
+        wind_cols = ["grid_id", "date"] + [c for c in wind.columns if c.startswith("wind_sector_")]
+        wind_daily = wind[wind_cols]
+
+    # LUR prior (static)
+    lur = pd.read_csv(required_files["lur"])
+    lur["grid_id"] = _normalize_grid_id_series(lur["grid_id"])
+    lur = lur.dropna(subset=["grid_id"])
+    lur = lur[["grid_id", "predicted_no2", "pred_std", "ci_lower_95", "ci_upper_95"]]
+
+    # Build full grid x date base using the union of all source date ranges so that
+    # days with EPA or traffic observations but no satellite retrieval (e.g. cloud cover)
+    # are still included in the merged dataset.
+    all_dates = set(epa_daily["date"].unique()) | set(sat_daily["date"].unique()) | set(traffic_daily["date"].unique())
+    if not all_dates:
+        raise ValueError("No dates found across any source; cannot build full daily grid.")
+    date_index = pd.Index(sorted(all_dates), name="date")
+    grid_index = pd.Index(grids["grid_id"].unique(), name="grid_id")
+    full_index = pd.MultiIndex.from_product([grid_index, date_index]).to_frame(index=False)
+
+    df = full_index.merge(grids, on="grid_id", how="left")
+    # Enforce grid_id -> lat/lon mapping
+    df = df.dropna(subset=["latitude", "longitude"])
+    # Merge in this order: satellite + LUR prior, then wind + traffic, then EPA
+    df = df.merge(sat_daily, on=["grid_id", "date"], how="left")
+    df = df.merge(lur, on="grid_id", how="left")
+    if wind_daily is not None:
+        df = df.merge(wind_daily, on=["grid_id", "date"], how="left")
+    df = df.merge(traffic_daily, on=["grid_id", "date"], how="left")
+    df["traffic_volume"] = df["traffic_volume"].fillna(0.0)
+    df = df.merge(epa_daily, on=["grid_id", "date"], how="left")
+
+    df["timestamp"] = pd.to_datetime(df["date"]).astype(str)
+    df = df.drop(columns=["date"])
+
+    out_path = data_dir / "FusionData_daily_merged.csv"
+    df.to_csv(out_path, index=False)
+    return out_path
+
+
 def flag_epa_outliers(
     df,
     column="epa_no2",
@@ -626,173 +721,6 @@ def _get_original_coords(data, scalers):
     return data.coords
 
 
-# def create_latitude_diagnostics(data, test_data, y_true_orig, predictions, scalers, output_dir):
-#     """
-#     Create latitude-based diagnostics plots to check spatial gradients/bias.
-
-#     Outputs:
-#         - epa_vs_latitude.png
-#         - epa_residuals_vs_latitude.png
-#         - source_means_by_latitude.png
-#         - source_counts_by_latitude.png
-#     """
-#     output_dir = Path(output_dir)
-#     output_dir.mkdir(parents=True, exist_ok=True)
-
-#     # Use original coordinates for consistent interpretation
-#     data_coords_orig = _get_original_coords(data, scalers)
-#     test_coords_orig = _get_original_coords(test_data, scalers)
-
-#     # 1) EPA observations vs latitude (scatter)
-#     epa_mask = data.source_masks['epa']
-#     epa_lat = data_coords_orig[epa_mask][:, 0]
-#     epa_vals = data.observations['epa'][epa_mask]
-
-#     # Subsample for readability
-#     if len(epa_vals) > 5000:
-#         idx = np.random.choice(len(epa_vals), 5000, replace=False)
-#         epa_lat = epa_lat[idx]
-#         epa_vals = epa_vals[idx]
-
-#     fig, ax = plt.subplots(figsize=(8, 6))
-#     ax.scatter(epa_lat, epa_vals, s=10, alpha=0.4, edgecolors='none')
-#     ax.set_xlabel("Latitude")
-#     ax.set_ylabel("EPA NO₂ (µg/m³)")
-#     ax.set_title("EPA Observations vs Latitude")
-#     ax.grid(True, alpha=0.3)
-#     fig.tight_layout()
-#     fig.savefig(output_dir / "epa_vs_latitude.png", dpi=300, bbox_inches="tight")
-#     plt.close(fig)
-
-#     # 2) EPA residuals vs latitude (test set)
-#     test_epa_mask = test_data.source_masks["epa"]
-#     test_lat = test_coords_orig[test_epa_mask][:, 0]
-#     test_true = test_data.observations["epa"][test_epa_mask]
-#     if scalers.normalize_targets and "epa" in scalers.target_std:
-#         test_true = test_true * scalers.target_std["epa"] + scalers.target_mean["epa"]
-#     test_pred = predictions.mean[test_epa_mask]
-#     residuals = test_true - test_pred
-
-#     if len(residuals) > 5000:
-#         idx = np.random.choice(len(residuals), 5000, replace=False)
-#         test_lat = test_lat[idx]
-#         residuals = residuals[idx]
-
-#     fig, ax = plt.subplots(figsize=(8, 6))
-#     ax.scatter(test_lat, residuals, s=10, alpha=0.4, edgecolors='none')
-#     ax.axhline(0.0, color="black", linewidth=1.0, alpha=0.6)
-#     ax.set_xlabel("Latitude")
-#     ax.set_ylabel("EPA Residual (True - Pred)")
-#     ax.set_title("EPA Residuals vs Latitude (Test)")
-#     ax.grid(True, alpha=0.3)
-#     fig.tight_layout()
-#     fig.savefig(output_dir / "epa_residuals_vs_latitude.png", dpi=300, bbox_inches="tight")
-#     plt.close(fig)
-
-#     # 3) Per-source mean/median by latitude bins
-#     n_bins = 12
-#     lat_all = data_coords_orig[:, 0]
-#     bins = np.quantile(lat_all, np.linspace(0, 1, n_bins + 1))
-#     bin_centers = 0.5 * (bins[1:] + bins[:-1])
-
-#     fig, ax = plt.subplots(figsize=(9, 6))
-#     for source, color in [("epa", "tab:blue"), ("low_cost", "tab:orange"), ("satellite", "tab:green")]:
-#         mask = data.source_masks[source]
-#         lat = data_coords_orig[mask][:, 0]
-#         vals = data.observations[source][mask]
-#         if len(vals) == 0:
-#             continue
-
-#         means = []
-#         medians = []
-#         for i in range(n_bins):
-#             bin_mask = (lat >= bins[i]) & (lat <= bins[i + 1])
-#             if bin_mask.any():
-#                 means.append(np.mean(vals[bin_mask]))
-#                 medians.append(np.median(vals[bin_mask]))
-#             else:
-#                 means.append(np.nan)
-#                 medians.append(np.nan)
-
-#         ax.plot(bin_centers, means, color=color, linewidth=2, label=f"{source} mean")
-#         ax.plot(bin_centers, medians, color=color, linestyle="--", linewidth=1.5, label=f"{source} median")
-
-#     ax.set_xlabel("Latitude (binned)")
-#     ax.set_ylabel("NO₂ (µg/m³)")
-#     ax.set_title("Per-Source NO₂ by Latitude Bin")
-#     ax.grid(True, alpha=0.3)
-#     ax.legend(fontsize=9)
-#     fig.tight_layout()
-#     fig.savefig(output_dir / "source_means_by_latitude.png", dpi=300, bbox_inches="tight")
-#     plt.close(fig)
-
-#     # 4) Observation counts by latitude bins
-#     fig, ax = plt.subplots(figsize=(9, 6))
-#     width = (bins[1] - bins[0]) * 0.25
-#     for i, (source, color, offset) in enumerate([
-#         ("epa", "tab:blue", -width),
-#         ("low_cost", "tab:orange", 0.0),
-#         ("satellite", "tab:green", width),
-#     ]):
-#         mask = data.source_masks[source]
-#         lat = data_coords_orig[mask][:, 0]
-#         counts = []
-#         for j in range(n_bins):
-#             bin_mask = (lat >= bins[j]) & (lat <= bins[j + 1])
-#             counts.append(int(bin_mask.sum()))
-#         ax.bar(bin_centers + offset, counts, width=width, color=color, alpha=0.7, label=source)
-
-#     ax.set_xlabel("Latitude (binned)")
-#     ax.set_ylabel("Observation Count")
-#     ax.set_title("Observation Density by Latitude Bin")
-#     ax.grid(True, alpha=0.3)
-#     ax.legend(fontsize=9)
-#     fig.tight_layout()
-#     fig.savefig(output_dir / "source_counts_by_latitude.png", dpi=300, bbox_inches="tight")
-#     plt.close(fig)
-
-
-# def save_north_south_summary(data, scalers, output_dir):
-#     """
-#     Save a north/south split summary table by latitude median.
-#     """
-#     output_dir = Path(output_dir)
-#     output_dir.mkdir(parents=True, exist_ok=True)
-
-#     coords_orig = _get_original_coords(data, scalers)
-#     lat = coords_orig[:, 0]
-#     lat_split = np.median(lat)
-
-#     records = []
-#     for region_name, region_mask in [
-#         ("south", lat <= lat_split),
-#         ("north", lat > lat_split),
-#     ]:
-#         for source in ["epa", "low_cost", "satellite"]:
-#             src_mask = data.source_masks[source]
-#             mask = region_mask & src_mask
-#             vals = data.observations[source][mask]
-#             if len(vals) == 0:
-#                 stats = {"count": 0, "mean": np.nan, "median": np.nan, "std": np.nan}
-#             else:
-#                 stats = {
-#                     "count": int(len(vals)),
-#                     "mean": float(np.mean(vals)),
-#                     "median": float(np.median(vals)),
-#                     "std": float(np.std(vals)),
-#                 }
-#             records.append({
-#                 "region": region_name,
-#                 "source": source,
-#                 **stats,
-#             })
-
-#     summary_df = pd.DataFrame(records)
-#     output_path = output_dir / "north_south_summary.csv"
-#     summary_df.to_csv(output_path, index=False)
-#     return output_path
-
-
 def save_experiment_summary(experiment_dir, model, trainer, learned_params,
                             epa_metrics, epa_test, scalers, timestamp, elapsed_time=None,
                             training_sources=None, base_vs_epa_metrics=None,
@@ -800,7 +728,9 @@ def save_experiment_summary(experiment_dir, model, trainer, learned_params,
                             epa_bias_corrected_metrics=None,
                             predictor_noise_source=None,
                             prediction_task=None,
-                            noise_std_summary=None):
+                            noise_std_summary=None,
+                            epa_r2=None,
+                            base_r2=None):
     """Save experiment configuration and results to text file.
 
     Parameters
@@ -935,6 +865,9 @@ def save_experiment_summary(experiment_dir, model, trainer, learned_params,
         if base_vs_epa_metrics is not None:
             base_dict = base_vs_epa_metrics.to_dict()
             fused_dict = epa_metrics.to_dict()
+            # MetricsResult.to_dict() doesn't include r2; use the values computed by the caller.
+            base_dict["r2"] = base_r2 if base_r2 is not None else float('nan')
+            fused_dict["r2"] = epa_r2 if epa_r2 is not None else float('nan')
 
             def pct_improve(lower_is_better: bool, base_val: float, new_val: float) -> float:
                 if base_val == 0:
@@ -1008,15 +941,23 @@ def main():
     main_pbar.set_description("Step 1/8: Loading data")
     print("\n[Step 1/8] Loading and preprocessing data...")
 
-    if not DATA_PATH.exists():
-        raise FileNotFoundError(
-            f"Data file not found at {DATA_PATH}. "
-            "Please ensure data exists."
-        )
+    if USE_INDIVIDUAL_SOURCES:
+        if not USE_DATA_DIR.exists():
+            raise FileNotFoundError(
+                f"Data directory not found at {USE_DATA_DIR}. "
+                "Please ensure data exists."
+            )
+        data_path_for_run = build_daily_dataset_from_sources(USE_DATA_DIR)
+    else:
+        if not DATA_PATH.exists():
+            raise FileNotFoundError(
+                f"Data file not found at {DATA_PATH}. "
+                "Please ensure data exists."
+            )
+        data_path_for_run = DATA_PATH
 
-    data_path_for_run = DATA_PATH
     if EPA_OUTLIER_FILTER:
-        df_outlier = pd.read_csv(DATA_PATH)
+        df_outlier = pd.read_csv(data_path_for_run)
         if "epa_no2" in df_outlier.columns:
             outlier_mask, outlier_info = flag_epa_outliers(df_outlier)
             n_outliers = int(outlier_mask.sum())
@@ -1034,8 +975,8 @@ def main():
                 else:
                     raise ValueError(f"Unknown EPA_OUTLIER_ACTION: {EPA_OUTLIER_ACTION}")
 
-                cleaned_path = DATA_PATH.with_name(
-                    f"{DATA_PATH.stem}{EPA_OUTLIER_CLEANED_SUFFIX}{DATA_PATH.suffix}"
+                cleaned_path = Path(data_path_for_run).with_name(
+                    f"{Path(data_path_for_run).stem}{EPA_OUTLIER_CLEANED_SUFFIX}{Path(data_path_for_run).suffix}"
                 )
                 df_outlier.to_csv(cleaned_path, index=False)
                 data_path_for_run = cleaned_path
@@ -1068,6 +1009,8 @@ def main():
             "timestamp": "timestamp",
             "satellite": "satellite_no2",
             "epa": EPA_INTERP_COLUMN if USE_EPA_INTERPOLATED else "epa_no2",
+            "traffic": "__disabled__",
+            "low_cost": "__disabled__",
         },
         covariate_columns=COVARIATE_COLUMNS,
     )
@@ -1108,10 +1051,11 @@ def main():
         )
         print("   ✓ Pre-calibration complete\n")
 
-    if USE_EPA_IN_TRAINING:
-        preprocessor = DataPreprocessor(normalize_targets=True)
-    else:
-        preprocessor = DataPreprocessor(normalize_targets=False)
+    # Per-source target normalization (~N(0,1)) is required regardless of
+    # USE_EPA_IN_TRAINING because satellite now feeds in raw TROPOMI mol/m^2
+    # column density (~1e-4 scale) rather than the converted ug/m3 value;
+    # MODEL_CONFIG's noise/lengthscale priors are tuned for normalized scale.
+    preprocessor = DataPreprocessor(normalize_targets=True)
     train_data, val_data, test_data = preprocessor.fit_transform(data)
     scalers = preprocessor.get_scalers()
 
@@ -1169,7 +1113,6 @@ def main():
         val_data = filter_data_by_sources(val_data, training_sources)
         model_config = MODEL_CONFIG.copy()
         model_config["sources"] = training_sources
-        globals()["USE_MULTITASK_MODEL"] = False
         globals()["PRIMARY_SOURCE"] = "epa"
     else:
         # Downsample satellite in train/val to reduce dominance
@@ -1183,7 +1126,6 @@ def main():
             val_data = filter_data_by_sources(val_data, training_sources)
             model_config = MODEL_CONFIG.copy()
             model_config["sources"] = training_sources
-            globals()["USE_MULTITASK_MODEL"] = False
             globals()["PRIMARY_SOURCE"] = "satellite" if HAS_SATELLITE else "epa"
         else:
             model_config = MODEL_CONFIG.copy()
@@ -1204,16 +1146,17 @@ def main():
     # Create prior mean if enabled
     prior_mean = None
     if USE_GRID_PRIOR:
-        print(f"   → Loading grid prior from {GRID_PRIOR_COLUMN} column...")
-        # Read CSV to get grid background values
-        df_prior = pd.read_csv(data_path_for_run)
-        # TROPOMI pattern prior disabled; use raw model prior directly.
-        # If you re-enable the TROPOMI path, restore the block that builds
-        # model_no2_10m_tropomi and sets prior_column accordingly.
-        prior_column = GRID_PRIOR_COLUMN
+        if ATMO_PLAN_AS_PRIOR and ATMO_PLAN_PATH.exists():
+            print(f"   → Loading ATMO-Plan prior from {ATMO_PLAN_PATH.name} ({ATMO_PLAN_PRIOR_COLUMN})...")
+            df_prior = pd.read_csv(ATMO_PLAN_PATH)
+            prior_column = ATMO_PLAN_PRIOR_COLUMN
+        else:
+            print(f"   → Loading LUR prior from {GRID_PRIOR_COLUMN} column...")
+            df_prior = pd.read_csv(data_path_for_run)
+            prior_column = GRID_PRIOR_COLUMN
         grid_background = df_prior[df_prior[prior_column].notna()][
-            ['grid_id', 'latitude', 'longitude', prior_column]
-        ].drop_duplicates('grid_id')
+            ['latitude', 'longitude', prior_column]
+        ].drop_duplicates(['latitude', 'longitude'])
 
         prior_mean = GridPriorMean(
             grid_coords=grid_background[['latitude', 'longitude']].values,
@@ -1228,24 +1171,8 @@ def main():
         else:
             print(f"     Output value range (original): [{prior_mean.value_range[0]:.1f}, {prior_mean.value_range[1]:.1f}] µg/m³")
         del df_prior, grid_background  # Free memory
-    elif USE_ATMO_PLAN_PRIOR and ATMO_PLAN_PATH.exists():
-        print(f"   → Loading ATMO-Plan prior from {ATMO_PLAN_PATH.name}...")
-        prior_mean = ATMOPlanMean(
-            raster_path=ATMO_PLAN_PATH,
-            scalers=preprocessor.scalers,
-            learnable_bias=ATMO_PLAN_LEARNABLE_BIAS,
-        )
-        print(f"   ✓ ATMO-Plan prior loaded: {prior_mean.raster_data.shape}")
-        print(f"     Value range: [{prior_mean.raster_data[~torch.isnan(prior_mean.raster_data)].min():.1f}, "
-              f"{prior_mean.raster_data[~torch.isnan(prior_mean.raster_data)].max():.1f}] µg/m³")
-    elif USE_ATMO_PLAN_PRIOR:
-        print(f"   ⚠ ATMO-Plan file not found: {ATMO_PLAN_PATH}")
-        print(f"     Using constant mean instead")
 
-    if USE_MULTITASK_MODEL:
-        model = MultiTaskSVGP(**model_config)
-    else:
-        model = FusionSVGP(prior_mean=prior_mean, **model_config)
+    model = FusionSVGP(prior_mean=prior_mean, **model_config)
     print(f"   ✓ Model initialized with {model.n_inducing} inducing points")
     print(model)
     main_pbar.update(1)
@@ -1556,6 +1483,10 @@ def main():
     if base_vs_epa_metrics is not None:
         base_dict = base_vs_epa_metrics.to_dict()
         fused_dict = epa_metrics.to_dict()
+        # MetricsResult.to_dict() doesn't include r2; compute it directly here.
+        base_dict["r2"] = r_squared(epa_test_orig, base_at_epa)
+        fused_dict["r2"] = r_squared(epa_test_orig, pred_mean_at_epa)
+
         def pct_improve(lower_is_better: bool, base_val: float, new_val: float) -> float:
             if base_val == 0:
                 return float('nan')
@@ -1614,6 +1545,7 @@ def main():
             y_pred_mean=pred.mean[mask],
             y_pred_std=pred.std[mask],
         ).to_dict()
+        per_source_metrics[source]["r2"] = r_squared(y_true_orig[source], pred.mean[mask])
 
     print("\nPer-source metrics:")
     for source, source_metrics in per_source_metrics.items():
@@ -1676,6 +1608,8 @@ def main():
         predictor_noise_source=predictor.noise_source,
         prediction_task=prediction_task,
         noise_std_summary=noise_std_summary,
+        epa_r2=r_squared(epa_test_orig, pred_mean_at_epa),
+        base_r2=r_squared(epa_test_orig, base_at_epa) if base_vs_epa_metrics is not None else None,
     )
     print(f"   ✓ Experiment summary saved to: {summary_file}")
 
@@ -2147,431 +2081,6 @@ def main():
 
     main_pbar.update(1)
 
-    # -------------------------------------------------------------------------
-    # Multi-Case Evaluation (Optional)
-    # -------------------------------------------------------------------------
-    if RUN_MULTI_CASE_EVALUATION:
-        print("\n" + "="*70)
-        print("Multi-Case Fusion Evaluation")
-        print("="*70)
-
-        full_train_data, full_val_data, _ = preprocessor.fit_transform(data)
-
-        def _mask_epa_by_grid_local(fdata):
-            if holdout_grid_ids is None or fdata.grid_ids is None:
-                return fdata
-            if "epa" not in fdata.source_masks:
-                return fdata
-            mask = fdata.source_masks["epa"].copy()
-            grid_mask = np.isin(fdata.grid_ids, holdout_grid_ids)
-            mask[grid_mask] = False
-            obs = fdata.observations["epa"].copy()
-            obs[grid_mask] = np.nan
-            new_obs = fdata.observations.copy()
-            new_masks = fdata.source_masks.copy()
-            new_obs["epa"] = obs
-            new_masks["epa"] = mask
-            from src.data.loader import FusionData
-            return FusionData(
-                coords=fdata.coords,
-                timestamps=fdata.timestamps,
-                observations=new_obs,
-                source_masks=new_masks,
-                grid_ids=fdata.grid_ids,
-                raw_timestamps=fdata.raw_timestamps if hasattr(fdata, "raw_timestamps") else None,
-                covariates=fdata.covariates,
-                metadata=fdata.metadata,
-            )
-
-        # Apply EPA holdout mask consistently for all cases
-        full_train_data = _mask_epa_by_grid_local(full_train_data)
-        full_val_data = _mask_epa_by_grid_local(full_val_data)
-
-        print("Training and evaluating 5 fusion scenarios (held-out EPA for evaluation)...")
-        print("EPA is used only where specified; no EPA interpolation.")
-
-        cases = build_multi_case_definitions()
-
-        all_case_results = []
-
-        case_model_config = MODEL_CONFIG.copy()
-        case_model_config['n_inducing'] = 200  # Reduce for speed
-        if getattr(train_data, "covariates", None) is not None:
-            case_model_config["n_covariates"] = train_data.covariates.shape[1]
-
-        case_training_config = TRAINING_CONFIG.copy()
-        case_training_config['n_epochs'] = 100  # Reduce for speed
-
-        # Build base prior mean (no TROPOMI pattern to avoid double-counting in ablations)
-        base_prior_mean = None
-        if USE_GRID_PRIOR:
-            df_prior_case = pd.read_csv(data_path_for_run)
-            grid_background = df_prior_case[df_prior_case[GRID_PRIOR_COLUMN].notna()][
-                ["grid_id", "latitude", "longitude", GRID_PRIOR_COLUMN]
-            ].drop_duplicates("grid_id")
-            base_prior_mean = GridPriorMean(
-                grid_coords=grid_background[["latitude", "longitude"]].values,
-                grid_values=grid_background[GRID_PRIOR_COLUMN].values,
-                scalers=preprocessor.scalers,
-                learnable_bias=GRID_PRIOR_LEARNABLE_BIAS,
-            )
-            del df_prior_case, grid_background
-
-        for case in cases:
-            case_name = case["name"]
-            sources = case["sources"]
-            print(f"\n{'─'*70}")
-            print(f"Training {case_name}")
-            print(f"{'─'*70}")
-            print(f"Sources: {', '.join(sources) if sources else 'prior-only'}")
-
-            case_dir = models_dir / case_name.replace(' ', '_').replace('(', '').replace(')', '')
-            case_dir.mkdir(parents=True, exist_ok=True)
-
-            if case["mode"] == "prior_only":
-                # Prior-only evaluation without training
-                epa_mask_test = test_data.source_masks["epa"]
-                x_query = np.column_stack([test_data.coords, test_data.timestamps])
-                x_tensor = torch.tensor(x_query, dtype=torch.float32)
-                prior_mean_vals = base_prior_mean(x_tensor).detach().cpu().numpy()
-
-                case_pred_mean_orig = prior_mean_vals
-                y_true = y_true_orig["epa"][epa_mask_test]
-                std_fallback = np.nanstd(y_true) if np.isfinite(y_true).any() else 1.0
-                case_pred_std_orig = np.full_like(case_pred_mean_orig, std_fallback)
-
-                case_metrics = evaluator.evaluate(
-                    y_true=y_true,
-                    y_pred_mean=case_pred_mean_orig[epa_mask_test],
-                    y_pred_std=case_pred_std_orig[epa_mask_test],
-                )
-
-                unique_times = np.unique(test_data.timestamps)
-                rmse_per_time = []
-                for t in unique_times:
-                    time_mask = (test_data.timestamps == t) & epa_mask_test
-                    if time_mask.sum() > 0:
-                        time_rmse = np.sqrt(np.mean((y_true_orig["epa"][time_mask] - case_pred_mean_orig[time_mask])**2))
-                        rmse_per_time.append(time_rmse)
-                    else:
-                        rmse_per_time.append(np.nan)
-
-                case_result = {
-                    'case_name': case_name,
-                    'sources': sources,
-                    'overall_rmse': case_metrics.to_dict()['rmse'],
-                    'overall_mae': case_metrics.to_dict()['mae'],
-                    'overall_r2': case_metrics.to_dict()['r2'],
-                    'unique_times': unique_times,
-                    'rmse_per_time': np.array(rmse_per_time),
-                    'training_time': 0.0,
-                }
-                all_case_results.append(case_result)
-
-                # Case visuals: scatter + time-series + spatial mean/uncertainty (prior only)
-                try:
-                    fig, ax = plt.subplots(figsize=(6, 6))
-                    ax.scatter(y_true_orig["epa"][epa_mask_test], case_pred_mean_orig[epa_mask_test], s=10, alpha=0.5)
-                    lims = [
-                        np.nanmin(y_true_orig["epa"][epa_mask_test]),
-                        np.nanmax(y_true_orig["epa"][epa_mask_test]),
-                    ]
-                    ax.plot(lims, lims, 'k--', linewidth=1)
-                    ax.set_xlabel("EPA Observed")
-                    ax.set_ylabel("Predicted")
-                    ax.set_title(f"{case_name}: EPA Observed vs Predicted")
-                    fig.tight_layout()
-                    fig.savefig(case_dir / "epa_scatter.png", dpi=300, bbox_inches="tight")
-                    plt.close(fig)
-
-                    plot_epa_timeseries_by_site(
-                        data=data,
-                        predictions=type("Pred", (), {"mean": base_prior_mean(
-                            torch.tensor(np.column_stack([data.coords, data.timestamps]), dtype=torch.float32)
-                        ).detach().cpu().numpy()}),
-                        scalers=scalers,
-                        output_dir=case_dir,
-                        n_sites=5,
-                    )
-
-                    if USE_ANALYSIS_GRID and analysis_grid is not None:
-                        t0 = timestamps[0] if "timestamps" in locals() else test_data.timestamps.min()
-                        lons, lats = analysis_grid.get_flat_coords()
-                        coords_grid = np.column_stack([lats, lons])
-                        x_grid = np.column_stack([coords_grid, np.full(len(coords_grid), t0)])
-                        grid_mean = base_prior_mean(torch.tensor(x_grid, dtype=torch.float32)).detach().cpu().numpy()
-                        plot_predictions(
-                            coords=coords_grid,
-                            values=grid_mean,
-                            title=f"{case_name}: Spatial Mean",
-                            save_path=case_dir / "spatial_mean.png",
-                        )
-                        plot_uncertainty(
-                            coords=coords_grid,
-                            std=np.full_like(grid_mean, std_fallback),
-                            title=f"{case_name}: Uncertainty (Std)",
-                            save_path=case_dir / "spatial_uncertainty.png",
-                        )
-                except Exception as exc:
-                    print(f"⚠ Case visualizations failed for {case_name}: {exc}")
-
-                # RMSE over time plot
-                fig, ax = plt.subplots(figsize=(8, 4))
-                ax.plot(np.arange(len(unique_times)), rmse_per_time, color="tab:blue")
-                ax.set_xlabel("Time Step")
-                ax.set_ylabel("RMSE")
-                ax.set_title(f"{case_name}: RMSE Over Time")
-                ax.grid(True, alpha=0.3)
-                fig.tight_layout()
-                fig.savefig(case_dir / "rmse_over_time.png", dpi=300, bbox_inches="tight")
-                plt.close(fig)
-
-                print(f"✓ RMSE: {case_result['overall_rmse']:.3f} µg/m³")
-                print(f"✓ MAE:  {case_result['overall_mae']:.3f} µg/m³")
-                print(f"✓ R²:   {case_result['overall_r2']:.3f}")
-                continue
-
-            train_filtered = filter_data_by_sources(full_train_data, sources)
-            val_filtered = filter_data_by_sources(full_val_data, sources)
-
-            if "satellite" in sources:
-                train_filtered = downsample_source(train_filtered, "satellite", keep_frac=SATELLITE_KEEP_FRAC)
-                val_filtered = downsample_source(val_filtered, "satellite", keep_frac=SATELLITE_KEEP_FRAC)
-
-            print(f"Train observations: {len(train_filtered.coords):,}")
-            print(f"Val observations:   {len(val_filtered.coords):,}")
-
-            case_model_config_with_sources = case_model_config.copy()
-            case_model_config_with_sources['sources'] = sources
-            if case["use_prior"]:
-                case_model = FusionSVGP(prior_mean=base_prior_mean, **case_model_config_with_sources)
-            else:
-                case_model = FusionSVGP(**case_model_config_with_sources)
-            case_trainer = Trainer(
-                model=case_model,
-                learning_rate=case_training_config['learning_rate'],
-                n_epochs=case_training_config['n_epochs'],
-                batch_size=case_training_config['batch_size'],
-            )
-
-            case_start = time.time()
-            try:
-                case_history = case_trainer.fit(train_filtered, val_filtered, verbose=True)
-                case_elapsed = time.time() - case_start
-                print(f"✓ Training completed in {case_elapsed/60:.2f} minutes")
-            except Exception as e:
-                print(f"⚠ Training FAILED for {case_name}: {e}")
-                print("  Skipping this case and continuing...")
-                all_case_results.append({
-                    'case': case_name,
-                    'sources': ', '.join(sources),
-                    'status': 'FAILED',
-                    'error': str(e)[:100],
-                })
-                continue
-
-            case_model_path = case_dir / "model.pth"
-            torch.save(case_model.state_dict(), case_model_path)
-
-            case_history_dict = case_history.to_dict()
-            max_len = len(case_history_dict['train_loss'])
-
-            val_losses = case_history_dict.get('val_loss', [])
-            if len(val_losses) > 0 and len(val_losses) < max_len:
-                val_interval = max_len // len(val_losses) if len(val_losses) > 1 else 5
-                val_losses_aligned = [None] * max_len
-                for i, val_loss in enumerate(val_losses):
-                    epoch_idx = (i + 1) * val_interval - 1
-                    if epoch_idx < max_len:
-                        val_losses_aligned[epoch_idx] = val_loss
-            else:
-                val_losses_aligned = val_losses if len(val_losses) == max_len else [None] * max_len
-
-            case_history_df = pd.DataFrame({
-                'epoch': list(range(1, max_len + 1)),
-                'train_loss': case_history_dict['train_loss'],
-                'val_loss': val_losses_aligned,
-            })
-            case_history_df.to_csv(case_dir / "training_history.csv", index=False)
-
-            case_noise_source = sources[0] if sources else "epa"
-            case_predictor = Predictor(case_model, noise_source=case_noise_source)
-
-
-            case_predictions = case_predictor.predict(test_data, verbose=False, task=case_noise_source)
-
-            if scalers.normalize_targets:
-                case_pred_mean_orig = case_predictions.mean * scalers.target_std['epa'] + scalers.target_mean['epa']
-                case_pred_std_orig = case_predictions.std * scalers.target_std['epa']
-            else:
-                case_pred_mean_orig = case_predictions.mean
-                case_pred_std_orig = case_predictions.std
-
-            epa_mask_test = test_data.source_masks["epa"]
-            case_metrics = evaluator.evaluate(
-                y_true=y_true_orig["epa"][epa_mask_test],
-                y_pred_mean=case_pred_mean_orig[epa_mask_test],
-                y_pred_std=case_pred_std_orig[epa_mask_test],
-            )
-
-            unique_times = np.unique(test_data.timestamps)
-            rmse_per_time = []
-
-            for t in unique_times:
-                time_mask = (test_data.timestamps == t) & epa_mask_test
-                if time_mask.sum() > 0:
-                    time_rmse = np.sqrt(np.mean((y_true_orig["epa"][time_mask] - case_pred_mean_orig[time_mask])**2))
-                    rmse_per_time.append(time_rmse)
-                else:
-                    rmse_per_time.append(np.nan)
-
-            case_result = {
-                'case_name': case_name,
-                'sources': sources,
-                'overall_rmse': case_metrics.to_dict()['rmse'],
-                'overall_mae': case_metrics.to_dict()['mae'],
-                'overall_r2': case_metrics.to_dict()['r2'],
-                'unique_times': unique_times,
-                'rmse_per_time': np.array(rmse_per_time),
-                'training_time': case_elapsed,
-            }
-            all_case_results.append(case_result)
-
-            # Case visuals: scatter, time-series, spatial mean/uncertainty
-            try:
-                fig, ax = plt.subplots(figsize=(6, 6))
-                ax.scatter(y_true_orig["epa"][epa_mask_test], case_pred_mean_orig[epa_mask_test], s=10, alpha=0.5)
-                lims = [
-                    np.nanmin(y_true_orig["epa"][epa_mask_test]),
-                    np.nanmax(y_true_orig["epa"][epa_mask_test]),
-                ]
-                ax.plot(lims, lims, 'k--', linewidth=1)
-                ax.set_xlabel("EPA Observed")
-                ax.set_ylabel("Predicted")
-                ax.set_title(f"{case_name}: EPA Observed vs Predicted")
-                fig.tight_layout()
-                fig.savefig(case_dir / "epa_scatter.png", dpi=300, bbox_inches="tight")
-                plt.close(fig)
-
-                case_predictions_all = case_predictor.predict(data, verbose=False, task=case_noise_source)
-                plot_epa_timeseries_by_site(
-                    data=data,
-                    predictions=case_predictions_all,
-                    scalers=scalers,
-                    output_dir=case_dir,
-                    n_sites=5,
-                )
-
-                if USE_ANALYSIS_GRID and analysis_grid is not None:
-                    t0 = timestamps[0] if "timestamps" in locals() else test_data.timestamps.min()
-                    case_grid_preds = case_predictor.predict_analysis_grid(
-                        analysis_grid,
-                        timestamp=t0,
-                        include_covariates=False,
-                        task=case_noise_source,
-                    )
-                    plot_predictions(
-                        coords=case_grid_preds.coords,
-                        values=case_grid_preds.mean,
-                        title=f"{case_name}: Spatial Mean",
-                        save_path=case_dir / "spatial_mean.png",
-                    )
-                    plot_uncertainty(
-                        coords=case_grid_preds.coords,
-                        std=case_grid_preds.std,
-                        title=f"{case_name}: Uncertainty (Std)",
-                        save_path=case_dir / "spatial_uncertainty.png",
-                    )
-            except Exception as exc:
-                print(f"⚠ Case visualizations failed for {case_name}: {exc}")
-
-            fig, ax = plt.subplots(figsize=(8, 4))
-            ax.plot(np.arange(len(unique_times)), rmse_per_time, color="tab:blue")
-            ax.set_xlabel("Time Step")
-            ax.set_ylabel("RMSE")
-            ax.set_title(f"{case_name}: RMSE Over Time")
-            ax.grid(True, alpha=0.3)
-            fig.tight_layout()
-            fig.savefig(case_dir / "rmse_over_time.png", dpi=300, bbox_inches="tight")
-            plt.close(fig)
-
-            print(f"✓ RMSE: {case_result['overall_rmse']:.3f} µg/m³")
-            print(f"✓ MAE:  {case_result['overall_mae']:.3f} µg/m³")
-            print(f"✓ R²:   {case_result['overall_r2']:.3f}")
-
-        # Create comparison plot
-        print(f"\n{'─'*70}")
-        print("Creating multi-case comparison plot...")
-        print(f"{'─'*70}")
-
-        fig, ax = plt.subplots(figsize=(12, 6))
-        colors = ['gray', 'black', 'blue', 'orange', 'red']  # 5 colors for 5 cases
-        linestyles = [':', '-', '--', '-.', '-']  # 5 line styles
-
-        for i, result in enumerate(all_case_results):
-            time_indices = np.arange(len(result['unique_times']))
-            ax.plot(
-                time_indices,
-                result['rmse_per_time'],
-                color=colors[i],
-                linestyle=linestyles[i],
-                linewidth=2,
-                label=result['case_name'],
-                marker='o' if i == 0 else None,
-                markersize=3,
-                alpha=0.8
-            )
-
-        ax.set_xlabel('Time Step', fontsize=12)
-        ax.set_ylabel('RMSE (µg/m³)', fontsize=12)
-        ax.set_title('Predictive Performance Comparison Across Fusion Cases',
-                     fontsize=14, fontweight='bold')
-        ax.legend(loc='best', fontsize=10)
-        ax.grid(True, alpha=0.3)
-        plt.tight_layout()
-
-        case_plot_path = figures_dir / "multi_case_comparison.png"
-        plt.savefig(case_plot_path, dpi=300, bbox_inches='tight')
-        plt.close()
-        print(f"✓ Saved comparison plot to {case_plot_path}")
-
-        # Create summary table
-        case_summary_data = []
-        for result in all_case_results:
-            case_summary_data.append({
-                'Case': result['case_name'],
-                'Sources': ', '.join(result['sources']),
-                'RMSE': f"{result['overall_rmse']:.3f}",
-                'MAE': f"{result['overall_mae']:.3f}",
-                'R²': f"{result['overall_r2']:.3f}",
-                'Mean RMSE (time)': f"{np.nanmean(result['rmse_per_time']):.3f}",
-                'Std RMSE (time)': f"{np.nanstd(result['rmse_per_time']):.3f}",
-                'Training Time (min)': f"{result['training_time']/60:.2f}",
-            })
-
-        case_summary_df = pd.DataFrame(case_summary_data)
-
-        # Save as CSV
-        case_summary_path = tables_dir / "multi_case_comparison.csv"
-        case_summary_df.to_csv(case_summary_path, index=False)
-
-        # Save as LaTeX
-        case_latex_path = tables_dir / "multi_case_comparison.tex"
-        case_summary_df.to_latex(
-            case_latex_path,
-            index=False,
-            caption="Multi-case fusion comparison: Predictive performance metrics across different data source combinations. All cases are evaluated on EPA test stations.",
-            label="tab:multi_case_comparison",
-            column_format="l" + "c" * (len(case_summary_df.columns) - 1),
-            escape=False,
-            float_format="%.3f"
-        )
-
-        print(f"✓ Saved summary table (CSV + LaTeX) to {tables_dir}")
-
-        print(f"\n{case_summary_df.to_string(index=False)}")
-        print(f"\n✓ Multi-case evaluation complete!")
-
     # Close the progress bar
     main_pbar.close()
 
@@ -2595,7 +2104,7 @@ def main():
     print("\nKey Performance Metrics:")
     print(f"  • RMSE: {epa_metrics.to_dict()['rmse']:.4f} µg/m³")
     print(f"  • MAE:  {epa_metrics.to_dict()['mae']:.4f} µg/m³")
-    print(f"  • R²:   {epa_metrics.to_dict()['r2']:.4f}")
+    print(f"  • R²:   {r_squared(epa_test_orig, pred_mean_at_epa):.4f}")
     print(f"  • Bias: {epa_metrics.to_dict()['bias']:.4f} µg/m³")
     print("\nTotal Runtime:")
     if hours > 0:
