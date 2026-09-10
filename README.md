@@ -89,6 +89,35 @@ This reads the CSVs saved by the pipeline and produces all figures inside `<run_
 
 All spatial maps use Gaussian-smoothed heatmaps overlaid on a basemap with EPA station locations.
 
+The three summary comparison figures (`pit_histograms.png`, `coverage_reliability.png`, `rmse_comparison.png`) are also written to `<run_dir>/publication_maps/diagnostics/` by `generate_figures.py`.
+
+## Inducing-Point Sweep (RQ2)
+
+To analyse the effect of the number of inducing points `M` on model performance and training time, run the pipeline with the `--sweep` flag:
+
+```bash
+# Run main pipeline + sweep over default M values [50, 100, 150, 200, 300, 400, 500]
+python experiments/run_demo_pipeline.py --sweep
+
+# Custom sweep values
+python experiments/run_demo_pipeline.py --sweep --sweep-values 50 100 200 300 500
+
+# Custom M for the main run + sweep
+python experiments/run_demo_pipeline.py --n-inducing 400 --epochs 150 --sweep
+```
+
+Sweep results are saved to `outputs/sweep_<timestamp>/`:
+
+| File | Contents |
+|---|---|
+| `sweep_n_inducing_summary.csv` | Per-M metrics (SVGP + GPKF) for all sweep values |
+| `rq2_sweep_table.csv` / `.md` | Formatted RQ2 comparison table |
+| `rq2_calibration_vs_M.png` | Calibration metrics (CRPS, NLL, coverage) vs M |
+| `rq2_tradeoff_rmse_runtime.png` | RMSE vs training time trade-off curve |
+| `rq2_interpretation.txt` | Auto-generated text summary of sweep findings |
+
+The sweep timestamp matches the main run timestamp (e.g. `sweep_20260308_010020` corresponds to `demo_run_20260308_010020`).
+
 **Optional:** For higher-quality basemap tiles, add a Stadia Maps API key to a `.env` file at the project root:
 
 ```
@@ -368,7 +397,7 @@ MIT License - see LICENSE file for details.
 ```bibtex
 @software{fusiongp2024,
   title={FusionGP: Scalable Probabilistic Multi-Source NO₂ Fusion},
-  author={Your Name},
+  author={Oduori, Gabriel},
   year={2024},
   url={https://github.com/GabrielOduori/fusiongp}
 }
