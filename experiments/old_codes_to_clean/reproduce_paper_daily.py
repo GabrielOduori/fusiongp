@@ -44,7 +44,7 @@ from src.evaluation import Evaluator, rmse, mse, mae, bias
 # =============================================================================
 
 # Fast run toggle (smoke-test). Set False for full experiment.
-FAST_MODE = True
+FAST_MODE = False
 
 # Use the vetted real dataset (no synthetic/low-cost inputs) to avoid data leakage.
 USE_DATA_DIR = Path("/media/gabriel-oduori/SERVER/dev_space/FusionGP/data/model_data")
@@ -55,6 +55,15 @@ TRAFFIC_PATH = DATA_PATH.with_name("traffic_timeseries.csv")
 LUR_PATH = DATA_PATH.with_name("lur_predictions.csv")
 ID_MAP_PATH = DATA_PATH.with_name("id_mappings.json")
 WIND_SECTOR_PATH = USE_DATA_DIR / "wind_sector_features_era5land_2023-06_daily.csv"
+
+# Overpass window: hours (inclusive) over which EPA and traffic readings are
+# averaged before entering the model, matching the TROPOMI overpass period
+# (~11:00-13:00 local). Without this, EPA/traffic were averaged over the full
+# 24h day while satellite only ever has midday retrievals, comparing a
+# whole-day EPA mean against a midday-only satellite mean. Same convention as
+# gam_ssm_lur (recommended by thesis examiners there).
+OVERPASS_WINDOW_START = 11
+OVERPASS_WINDOW_END = 14
 
 # Include traffic (time-varying) as the covariate driving NO2 changes.
 WIND_SECTOR_COLUMNS = [
@@ -81,7 +90,8 @@ MODEL_CONFIG = {
 TRAINING_CONFIG = {
     "learning_rate": 0.005,  # Lower LR for stable convergence with small EPA dataset
     "n_epochs": 150,  # More epochs needed with lower LR and sparse data
-    "batch_size": 256,  # Smaller batches = more gradient updates per epoch (only 261 EPA obs)
+    "batch_size": 4096,  # train_loader iterates the full fused dataset (~480k rows), not EPA alone;
+    # 256 gave ~1875 batches/epoch and made each epoch take minutes on CPU
     "val_interval": 5,
     "gradient_clip": 1.0,
 }
@@ -101,7 +111,7 @@ RUN_CASE0_EPA_ONLY = False
 USE_SPATIOTEMPORAL_CV = True
 CV_GRID_FOLDS = 5
 CV_TIME_FOLDS = 4
-CV_MAX_FOLDS = None  # Set to an int to limit total folds for quick runs
+CV_MAX_FOLDS = 3  # Set to an int to limit total folds for quick runs
 CV_TRAIN_RATIO = 0.85
 CV_VAL_RATIO = 0.15
 CV_RANDOM_SEED = 42
@@ -493,12 +503,16 @@ def build_daily_dataset_from_sources(data_dir: Path) -> Path:
     grids["grid_id"] = _normalize_grid_id_series(grids["grid_id"])
     grids = grids.dropna(subset=["grid_id"])
 
-    # EPA daily mean
+    # EPA overpass-window mean: restrict to the same hours TROPOMI overpasses
+    # occur in (OVERPASS_WINDOW_START-OVERPASS_WINDOW_END, inclusive) so EPA
+    # and satellite represent the same time-of-day before fusion.
     epa = pd.read_csv(required_files["epa"])
     epa["grid_id"] = _normalize_grid_id_series(epa["grid_id"])
     epa["timestamp_utc"] = pd.to_datetime(epa["timestamp_utc"], errors="coerce")
     epa = epa.dropna(subset=["grid_id", "timestamp_utc"])
     epa["date"] = epa["timestamp_utc"].dt.date
+    epa["hour"] = epa["timestamp_utc"].dt.hour
+    epa = epa[(epa["hour"] >= OVERPASS_WINDOW_START) & (epa["hour"] <= OVERPASS_WINDOW_END)]
     epa_daily = epa.groupby(["grid_id", "date"], as_index=False).agg({"epa_no2": "mean"})
 
     # Satellite daily mean (use ug/m3)
@@ -513,12 +527,14 @@ def build_daily_dataset_from_sources(data_dir: Path) -> Path:
         .rename(columns={"tropomi_no2_ug_m3": "satellite_no2"})
     )
 
-    # Traffic daily mean
+    # Traffic overpass-window mean: same window as EPA, for consistency.
     traffic = pd.read_csv(required_files["traffic"])
     traffic["grid_id"] = _normalize_grid_id_series(traffic["grid_id"])
     traffic["traffic_end_time"] = pd.to_datetime(traffic["traffic_end_time"], errors="coerce")
     traffic = traffic.dropna(subset=["grid_id", "traffic_end_time"])
     traffic["date"] = traffic["traffic_end_time"].dt.date
+    traffic["hour"] = traffic["traffic_end_time"].dt.hour
+    traffic = traffic[(traffic["hour"] >= OVERPASS_WINDOW_START) & (traffic["hour"] <= OVERPASS_WINDOW_END)]
     traffic_daily = (
         traffic.groupby(["grid_id", "date"], as_index=False)
         .agg({"traffic_volume": "mean"})
@@ -543,10 +559,13 @@ def build_daily_dataset_from_sources(data_dir: Path) -> Path:
     lur = lur.dropna(subset=["grid_id"])
     lur = lur[["grid_id", "predicted_no2", "pred_std", "ci_lower_95", "ci_upper_95"]]
 
-    # Build full grid x date base using satellite date range (covers entire area)
-    if sat_daily.empty:
-        raise ValueError("Satellite daily data is empty; cannot build full daily grid.")
-    date_index = pd.Index(sorted(sat_daily["date"].unique()), name="date")
+    # Build full grid x date base using the union of all source date ranges so that
+    # days with EPA or traffic observations but no satellite retrieval (e.g. cloud cover)
+    # are still included in the merged dataset.
+    all_dates = set(epa_daily["date"].unique()) | set(sat_daily["date"].unique()) | set(traffic_daily["date"].unique())
+    if not all_dates:
+        raise ValueError("No dates found across any source; cannot build full daily grid.")
+    date_index = pd.Index(sorted(all_dates), name="date")
     grid_index = pd.Index(grids["grid_id"].unique(), name="grid_id")
     full_index = pd.MultiIndex.from_product([grid_index, date_index]).to_frame(index=False)
 
