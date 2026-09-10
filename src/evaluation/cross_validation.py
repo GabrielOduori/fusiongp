@@ -20,8 +20,8 @@ Example
 -------
 >>> cv = SpatialCV(n_folds=5)
 >>> for train_idx, test_idx in cv.split(data):
-...     # Train and evaluate
-...     pass
+...     train_model(train_idx)
+...     evaluate_model(test_idx)
 """
 
 from __future__ import annotations
@@ -64,12 +64,12 @@ class CVStrategy(ABC):
         test_idx : np.ndarray
             Test indices.
         """
-        pass
+        raise NotImplementedError
     
     @abstractmethod
     def get_n_splits(self) -> int:
         """Return the number of splits."""
-        pass
+        raise NotImplementedError
 
 
 class RandomCV(CVStrategy):

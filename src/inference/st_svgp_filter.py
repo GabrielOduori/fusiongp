@@ -8,6 +8,7 @@ STSVGPTrainer for CVI natural-gradient updates.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Dict, Optional, Tuple
 
@@ -15,6 +16,8 @@ import numpy as np
 import torch
 
 from src.models.st_svgp import STSVGPModel
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -238,8 +241,8 @@ class STSVGPFilter:
                     v = np.linalg.solve(L_S, innovation)
                     logdet = 2.0 * np.sum(np.log(np.diag(L_S)))
                     loglik += -0.5 * (len(innovation) * np.log(2.0 * np.pi) + logdet + v.T @ v)
-                except Exception:
-                    pass
+                except np.linalg.LinAlgError as exc:
+                    logger.debug("Skipping log-likelihood contribution: %s", exc)
                 m_t = m_t + K @ innovation
                 P_t = (np.eye(P_t.shape[0]) - K @ H_all) @ P_t
                 P_t = 0.5 * (P_t + P_t.T)

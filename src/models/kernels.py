@@ -312,8 +312,8 @@ class SpatioTemporalKernel(Kernel):
         # Temporal lengthscale
         self.temporal_kernel.lengthscale = torch.tensor(temporal_ls, dtype=torch.float32)
 
-        # Output scale
-        self.outputscale_param.data = torch.tensor(outputscale, dtype=torch.float32)
+        # Output scale (raw param is log-space; see `outputscale` property)
+        self.outputscale_param.data = torch.log(torch.tensor(outputscale, dtype=torch.float32))
         
         logger.debug(
             f"Initialized lengthscales: "
@@ -369,7 +369,7 @@ class SpatioTemporalKernel(Kernel):
             covar_diag = 1.0
             if self.covariate_kernel is not None:
                 covar_diag = self.covariate_kernel(x1, x2, diag=True, **params)
-            return self.outputscale_param * spatial_diag * temporal_diag * covar_diag
+            return self.outputscale * spatial_diag * temporal_diag * covar_diag
 
         # Gridded optimization for training (x1 == x2)
         if use_gridded and x1 is x2 and self.covariate_kernel is None:
@@ -449,7 +449,7 @@ class SpatioTemporalKernel(Kernel):
         K_full = K_s[spatial_inv][:, spatial_inv] * K_t[temporal_inv][:, temporal_inv]
 
         # Apply output scale
-        return self.outputscale_param * K_full
+        return self.outputscale * K_full
 
     def _forward_elementwise(
         self,
@@ -503,7 +503,7 @@ class SpatioTemporalKernel(Kernel):
             covar = covar * covariate_covar
 
         # Apply output scale
-        return self.outputscale_param * covar
+        return self.outputscale * covar
     
     @property
     def spatial_lengthscale(self) -> torch.Tensor:
@@ -517,8 +517,15 @@ class SpatioTemporalKernel(Kernel):
     
     @property
     def outputscale(self) -> torch.Tensor:
-        """Get output scale."""
-        return self.outputscale_param
+        """Get output scale.
+
+        Log-parameterized (outputscale = exp(raw)) rather than squared: the
+        squared form's gradient (2*raw) vanishes as raw->0, trapping the
+        optimizer near zero once it drifts close (observed empirically as
+        every LOSO fold converging to the numerical floor). exp's gradient
+        stays proportional to the value itself, so it has no such dead zone.
+        """
+        return self.outputscale_param.exp()
     
     def get_hyperparameters(self) -> dict:
         """

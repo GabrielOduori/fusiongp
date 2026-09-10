@@ -34,7 +34,7 @@ Update (actual EPA/satellite observations at day t):
     P_t  = (I - K @ H) @ P_pred
 
 Predict at grid locations s:
-    f_mean(s) = k(s, Z_s) @ K_MM⁻¹ @ m_t
+    f_mean(s) = μ(s) + k(s, Z_s) @ K_MM⁻¹ @ (m_t - μ(Z_s))
     f_var(s)  = k(s,s) - k(s,Z_s) @ K_MM⁻¹ @ k(Z_s,s)
               + k(s,Z_s) @ K_MM⁻¹ @ P_t @ K_MM⁻¹ @ k(Z_s,s)
 
@@ -49,6 +49,7 @@ Example
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple, TYPE_CHECKING
 
@@ -135,10 +136,12 @@ class GPKalmanFilter:
         covariate_df=None,
         covariate_cols=None,
         train_data=None,
+        pre_calibrated_sources=None,
     ) -> None:
         self.model = model
         self.scalers = scalers
         self.device = torch.device(device)
+        self.pre_calibrated_sources = set(pre_calibrated_sources or [])
 
         # Pre-build spatial state components
         self._Z_s = None          # (M_s, 2) normalised spatial inducing locs
@@ -150,8 +153,20 @@ class GPKalmanFilter:
         # Optional covariate correction to prior mean
         self._cov_beta = None          # (n_cov + 1,) ridge-regression coefficients
         self._cov_at_Z_s = None        # (M_s, n_cov) covariate values at inducing pts
-        if covariate_df is not None and covariate_cols and train_data is not None:
+        self._prior_mean_cache = {}
+        use_covariate_prior_correction = (
+            os.getenv("GPKF_COVARIATE_PRIOR_CORRECTION", "1").lower()
+            not in {"0", "false", "no"}
+        )
+        if (
+            use_covariate_prior_correction
+            and covariate_df is not None
+            and covariate_cols
+            and train_data is not None
+        ):
             self._build_covariate_correction(covariate_df, covariate_cols, train_data)
+        elif covariate_df is not None and covariate_cols and train_data is not None:
+            logger.info("Skipping GPKF covariate prior correction by environment flag.")
 
     # ------------------------------------------------------------------
     # State construction
@@ -229,6 +244,12 @@ class GPKalmanFilter:
         grid_lat = unique_cells[lat_col].to_numpy()
         grid_lon = unique_cells[lon_col].to_numpy()
         grid_coords = np.stack([grid_lat, grid_lon], axis=1)  # (n_cells, 2)
+        self._cov_grid_coords = grid_coords
+        try:
+            from scipy.spatial import cKDTree
+            self._cov_grid_tree = cKDTree(grid_coords)
+        except ImportError:
+            self._cov_grid_tree = None
 
         Z_raw = (
             self._Z_s.cpu().numpy() * self.scalers.coord_scale + self.scalers.coord_min
@@ -258,9 +279,16 @@ class GPKalmanFilter:
                 np.stack([row_lats, row_lons], axis=1), axis=0, return_index=True
             )
             uniq_covs = row_covs[first_idx]             # (n_unique_cells, n_cov)
-            # Vectorized NN: unique cells in this day → global grid cells
-            diff_r = uniq_coords[:, None, :] - grid_coords[None, :, :]  # (n_uniq, n_cells, 2)
-            ci_all = np.argmin((diff_r ** 2).sum(axis=2), axis=1)        # (n_uniq,)
+            # Unique cells in this day → global grid cells. Use the KD-tree to
+            # avoid an O(n_unique * n_cells) distance matrix for every day.
+            if self._cov_grid_tree is not None:
+                _, ci_all = self._cov_grid_tree.query(uniq_coords)
+            else:
+                ci_all = np.empty(len(uniq_coords), dtype=int)
+                for start in range(0, len(uniq_coords), 5000):
+                    end = min(start + 5000, len(uniq_coords))
+                    diff_r = uniq_coords[start:end, None, :] - grid_coords[None, :, :]
+                    ci_all[start:end] = np.argmin((diff_r ** 2).sum(axis=2), axis=1)
             cell_X = np.zeros((len(grid_coords), n_cov))
             cell_X[ci_all] = uniq_covs
             # Store full grid — indexed by grid cell index (0..n_cells-1)
@@ -367,6 +395,69 @@ class GPKalmanFilter:
         X_day_norm = np.clip((X_day - self._cov_mean) / self._cov_std, -5.0, 5.0)
         X_design   = np.column_stack([np.ones(len(m0)), X_day_norm])
         return m0 + X_design @ self._cov_beta
+
+    def _prior_mean_at_locations(
+        self,
+        coords_norm: np.ndarray,
+        day_val: float,
+        batch_size: int = 5000,
+    ) -> np.ndarray:
+        """
+        Prior mean at arbitrary locations for a specific day (normalised space).
+
+        This evaluates the full-resolution prior mean directly at the requested
+        locations, then adds the same daily traffic/wind correction used at the
+        inducing points when that correction is available.
+        """
+        coords_norm = np.asarray(coords_norm, dtype=np.float64)
+        n = coords_norm.shape[0]
+        cache_key = None
+        if n > 1000:
+            cache_key = (
+                round(float(day_val), 6),
+                coords_norm.shape,
+                tuple(np.round(coords_norm[0], 8)),
+                tuple(np.round(coords_norm[-1], 8)),
+            )
+            cached = self._prior_mean_cache.get(cache_key)
+            if cached is not None:
+                return cached.copy()
+
+        n_cov = self.model.n_covariates
+        prior = np.zeros(n, dtype=np.float64)
+
+        for start in range(0, n, batch_size):
+            end = min(start + batch_size, n)
+            c_t = torch.tensor(coords_norm[start:end], dtype=torch.float32)
+            pad = torch.zeros(end - start, 1 + n_cov, dtype=torch.float32)
+            x = torch.cat([c_t, pad], dim=-1)
+            with torch.no_grad():
+                prior[start:end] = (
+                    self.model.mean_module(x).cpu().numpy().astype(np.float64)
+                )
+
+        if self._cov_beta is None or not getattr(self, "_daily_X_cache", None):
+            return prior
+
+        coords_raw = coords_norm * self.scalers.coord_scale + self.scalers.coord_min
+        if getattr(self, "_cov_grid_tree", None) is not None:
+            _, nn = self._cov_grid_tree.query(coords_raw)
+        else:
+            grid_coords = self._cov_grid_coords
+            nn = np.empty(n, dtype=int)
+            for start in range(0, n, batch_size):
+                end = min(start + batch_size, n)
+                diff = coords_raw[start:end, None, :] - grid_coords[None, :, :]
+                nn[start:end] = np.argmin((diff ** 2).sum(axis=2), axis=1)
+
+        best_day = min(self._daily_X_cache, key=lambda d: abs(d - day_val))
+        X_day = self._daily_X_cache[best_day][nn]
+        X_day_norm = np.clip((X_day - self._cov_mean) / self._cov_std, -5.0, 5.0)
+        X_design = np.column_stack([np.ones(n), X_day_norm])
+        prior = prior + X_design @ self._cov_beta
+        if cache_key is not None:
+            self._prior_mean_cache[cache_key] = prior.copy()
+        return prior
 
     # ------------------------------------------------------------------
     # OU transition parameters
@@ -488,6 +579,8 @@ class GPKalmanFilter:
 
     def _source_calibration_params(self, source: str) -> Tuple[float, float]:
         """Calibration slope/intercept for a given source."""
+        if source in self.pre_calibrated_sources:
+            return 1.0, 0.0
         if source == "satellite":
             with torch.no_grad():
                 slope = float(self.model.likelihood.sat_slope.item())
@@ -544,11 +637,13 @@ class GPKalmanFilter:
         grid_coords_norm: np.ndarray,
         m_t: np.ndarray,
         P_t: np.ndarray,
+        day_val: float,
+        prior_at_Z: Optional[np.ndarray] = None,
     ) -> Tuple[np.ndarray, np.ndarray]:
         """
         Predict mean and variance at grid locations given current state.
 
-        f_mean(s) = K(s, Z_s) @ K_MM⁻¹ @ m_t
+        f_mean(s) = μ(s) + K(s, Z_s) @ K_MM⁻¹ @ (m_t - μ(Z_s))
         f_var(s)  = k(s,s) - k(s,Z_s)@K_MM⁻¹@k(Z_s,s)
                   + k(s,Z_s)@K_MM⁻¹@P_t@K_MM⁻¹@k(Z_s,s)
 
@@ -557,6 +652,8 @@ class GPKalmanFilter:
         grid_coords_norm : np.ndarray, shape (n_grid, 2)
         m_t : np.ndarray, shape (M_s,)
         P_t : np.ndarray, shape (M_s, M_s)
+        day_val : float
+        prior_at_Z : np.ndarray, optional, shape (M_s,)
 
         Returns
         -------
@@ -570,6 +667,10 @@ class GPKalmanFilter:
 
         means = np.zeros(n_grid)
         vars_ = np.zeros(n_grid)
+        prior_full = self._prior_mean_at_locations(grid_coords_norm, day_val)
+        if prior_at_Z is None:
+            prior_at_Z = self._prior_mean_for_day(day_val)
+        residual_t = m_t - prior_at_Z
 
         pad_z = torch.zeros(n_s, 1 + n_cov, dtype=torch.float32)
         Z_padded = torch.cat([self._Z_s.float(), pad_z], dim=-1)
@@ -604,8 +705,8 @@ class GPKalmanFilter:
             # α = K_MM_inv @ k(Z_s, s)  (M_s, n_b)
             alpha = K_MM_inv_np @ K_gZ_np.T  # (M_s, n_b)
 
-            # mean = k(s, Z_s) @ K_MM_inv @ m_t  (correct GP interpolation)
-            means[start:end] = m_t @ alpha  # (M_s,) @ (M_s, n_b) = (n_b,)
+            # Reconstruct the full field as fine-grid prior plus smooth residual.
+            means[start:end] = prior_full[start:end] + residual_t @ alpha
 
             # prior variance reduction: k_ss - k_sZ K_MM_inv k_Zs
             prior_reduction = np.einsum("ij,ji->i", K_gZ_np, alpha)  # (n_b,)
@@ -687,8 +788,8 @@ class GPKalmanFilter:
                 f"sat_intercept={sat_intercept:.4f}, "
                 f"noise_var_epa={noise_epa:.4f}, noise_var_sat={noise_sat:.4f}"
             )
-        except Exception:
-            pass
+        except (AttributeError, KeyError, TypeError, ValueError) as exc:
+            logger.debug("Skipping GPKF likelihood diagnostics: %s", exc)
 
         # Normalise grid coordinates
         grid_coords_norm = (
@@ -748,7 +849,9 @@ class GPKalmanFilter:
 
             # Diagnostic: print state prior to update on the first 3 days
             if d_idx < 3:
-                m_grid_diag, _ = self._predict_grid(grid_coords_norm, m_t, P_t)
+                m_grid_diag, _ = self._predict_grid(
+                    grid_coords_norm, m_t, P_t, day_val, prior_at_Z=mu_today
+                )
                 tqdm.write(
                     f"  [DIAG] Day {d_idx:02d} PRE-UPDATE: state m_t "
                     f"range=[{m_t.min():.3f}, {m_t.max():.3f}], "
@@ -776,6 +879,8 @@ class GPKalmanFilter:
                 # Observation model: y = a * H f + b + eps
                 H_scaled = H * obs_slope[:, None]
                 R = np.diag(noise_var)                        # (n_obs, n_obs)
+                prior_obs = self._prior_mean_at_locations(obs_coords_norm, day_val)
+                residual_t = m_t - mu_today
 
                 if d_idx < 3:
                     tqdm.write(
@@ -797,8 +902,10 @@ class GPKalmanFilter:
                 except np.linalg.LinAlgError:
                     Kalman_gain = P_t @ H_scaled.T @ np.linalg.pinv(S)
 
-                # Innovation
-                innovation = y_obs - (H_scaled @ m_t + obs_intercept)  # (n_obs,)
+                # Innovation under nonzero prior-mean residual reconstruction:
+                # y = slope * (mu(obs) + H @ (m_t - mu(Z))) + intercept + eps
+                pred_obs = obs_slope * (prior_obs + H @ residual_t) + obs_intercept
+                innovation = y_obs - pred_obs  # (n_obs,)
 
                 # State update (standard form)
                 m_t = m_t + Kalman_gain @ innovation
@@ -818,13 +925,17 @@ class GPKalmanFilter:
                 )
 
             # --- Predict at all grid locations ---
-            m_grid, v_grid = self._predict_grid(grid_coords_norm, m_t, P_t)
+            m_grid, v_grid = self._predict_grid(
+                grid_coords_norm, m_t, P_t, day_val, prior_at_Z=mu_today
+            )
             mean_norm[:, d_idx] = m_grid
             var_norm[:, d_idx] = v_grid
 
             # --- Predict at eval locations if provided ---
             if has_eval:
-                m_eval, v_eval = self._predict_grid(eval_coords_norm, m_t, P_t)
+                m_eval, v_eval = self._predict_grid(
+                    eval_coords_norm, m_t, P_t, day_val, prior_at_Z=mu_today
+                )
                 eval_mean_norm[:, d_idx] = m_eval
                 eval_var_norm[:, d_idx] = v_eval
 

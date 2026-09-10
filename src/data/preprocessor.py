@@ -401,6 +401,7 @@ class DataPreprocessor:
         test_ratio: Optional[float] = None,
         split_strategy: str = 'random',
         random_seed: int = 42,
+        epa_holdout_grid_ids: Optional[List[str]] = None,
     ) -> Tuple[FusionData, FusionData, FusionData]:
         """
         Fit the preprocessor and split data into train/val/test sets.
@@ -416,9 +417,13 @@ class DataPreprocessor:
         test_ratio : float, optional
             Fraction of data for testing. If None, computed as 1 - train - val.
         split_strategy : str, default='random'
-            Splitting strategy: 'random', 'temporal', or 'spatial'.
+            Splitting strategy: 'random', 'temporal', 'spatial', or
+            'epa_station_holdout'.
         random_seed : int, default=42
             Random seed for reproducibility.
+        epa_holdout_grid_ids : list[str], optional
+            Explicit EPA station grid IDs to hold out when split_strategy is
+            'epa_station_holdout'. If omitted, stations are chosen randomly.
             
         Returns
         -------
@@ -491,7 +496,51 @@ class DataPreprocessor:
             train_idx = indices[np.isin(data.grid_ids, list(train_grids))]
             val_idx = indices[np.isin(data.grid_ids, list(val_grids))]
             test_idx = indices[np.isin(data.grid_ids, list(test_grids))]
-            
+
+        elif split_strategy == 'epa_station_holdout':
+            epa_mask = data.source_masks.get('epa')
+            if epa_mask is None or not np.any(epa_mask):
+                raise ValueError("epa_station_holdout split requires at least one EPA observation")
+
+            epa_grids = np.unique(data.grid_ids[epa_mask])
+            if epa_holdout_grid_ids:
+                requested = np.array([str(grid_id) for grid_id in epa_holdout_grid_ids])
+                missing = sorted(set(requested) - set(map(str, epa_grids)))
+                if missing:
+                    raise ValueError(
+                        "EPA holdout grid IDs are not EPA station grids: "
+                        + ", ".join(missing)
+                    )
+                test_grids = set(requested)
+            else:
+                rng = np.random.default_rng(random_seed)
+                epa_grids = epa_grids.copy()
+                rng.shuffle(epa_grids)
+
+                n_test_grids = max(1, int(round(len(epa_grids) * test_ratio)))
+                n_test_grids = min(n_test_grids, max(1, len(epa_grids) - 1))
+                test_grids = set(epa_grids[:n_test_grids])
+
+            test_grid_mask = np.isin(data.grid_ids, list(test_grids))
+            test_idx = indices[test_grid_mask]
+            remaining_idx = indices[~test_grid_mask]
+            if len(remaining_idx) == 0:
+                raise ValueError("epa_station_holdout left no rows for training/validation")
+
+            val_fraction = val_ratio / max(train_ratio + val_ratio, 1e-12)
+            train_idx, val_idx = train_test_split(
+                remaining_idx,
+                test_size=val_fraction,
+                random_state=random_seed,
+            )
+            self.epa_holdout_grid_ids_ = np.array(sorted(test_grids))
+            logger.info(
+                "EPA station holdout split: held out %d/%d EPA station grid cells: %s",
+                len(test_grids),
+                len(epa_grids),
+                ", ".join(map(str, sorted(test_grids))),
+            )
+	            
         else:
             raise ValueError(f"Unknown split strategy: {split_strategy}")
         

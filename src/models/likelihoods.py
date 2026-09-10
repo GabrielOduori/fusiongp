@@ -215,12 +215,12 @@ class MultiSourceLikelihood(Likelihood):
         Returns
         -------
         Dict[str, torch.Tensor]
-            Noise std per source (exp for positivity, no bounds).
+            Noise std per source, constrained to configured bounds.
         """
         result = {}
+        min_noise, max_noise = self.noise_bounds
         for source in self.sources:
-            # exp for positivity, NO CLAMPING - let model learn freely
-            noise = self.raw_noise[source].exp()
+            noise = self.raw_noise[source].exp().clamp(min=min_noise, max=max_noise)
             result[source] = noise
         return result
     
@@ -401,14 +401,21 @@ class MultiSourceLikelihood(Likelihood):
         """
         f_mean = function_dist.mean
         f_var = function_dist.variance
-        
+
+        if source_masks.shape[-1] != len(self.sources):
+            raise ValueError(
+                f"source_masks has {source_masks.shape[-1]} columns but likelihood "
+                f"expects {len(self.sources)} sources {self.sources}. Build the "
+                f"dataset with sources={self.sources} so columns align."
+            )
+
         total_log_prob = torch.tensor(0.0, device=f_mean.device, dtype=f_mean.dtype)
-        
+
         for source_idx, source in enumerate(self.sources):
             mask = source_masks[:, source_idx]
             if not mask.any():
                 continue
-            
+
             # Get observations for this source
             y = observations[mask, source_idx]
             f_m = f_mean[mask]
@@ -581,6 +588,13 @@ class MaskedMultitaskGaussianLikelihood(Likelihood):
     ) -> torch.Tensor:
         f_mean = function_dist.mean
         f_var = function_dist.variance
+
+        if source_masks.shape[-1] != len(self.sources):
+            raise ValueError(
+                f"source_masks has {source_masks.shape[-1]} columns but likelihood "
+                f"expects {len(self.sources)} sources {self.sources}. Build the "
+                f"dataset with sources={self.sources} so columns align."
+            )
 
         total_log_prob = torch.tensor(0.0, device=f_mean.device, dtype=f_mean.dtype)
 
