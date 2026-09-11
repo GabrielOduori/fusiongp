@@ -139,6 +139,8 @@ class FusionSVGP(ApproximateGP):
         n_covariates: int = 0,
         initial_lengthscales: Optional[Dict[str, float]] = None,
         initial_noise: Optional[Dict[str, float]] = None,
+        noise_bounds: tuple[float, float] = (0.01, 100.0),
+        variational_jitter: float = 1e-4,
         learn_kernel_hyperparams: bool = True,
         learn_noise: bool = True,
         learn_noise_sources: Optional[List[str]] = None,
@@ -171,6 +173,10 @@ class FusionSVGP(ApproximateGP):
             Initial kernel lengthscales.
         initial_noise : Dict[str, float]
             Initial noise std per source.
+        noise_bounds : tuple[float, float]
+            Lower and upper bounds for learned likelihood noise std.
+        variational_jitter : float
+            Diagonal jitter used by the variational strategy Cholesky factor.
         learn_kernel_hyperparams : bool
             Optimize kernel lengthscale/outputscale.
         learn_noise : bool
@@ -189,6 +195,7 @@ class FusionSVGP(ApproximateGP):
         self.kernel_type = kernel_type
         self.learn_inducing_locations = learn_inducing_locations
         self.n_covariates = n_covariates
+        self.variational_jitter = float(variational_jitter)
 
         # Allow separate spatial and temporal kernel types
         self.spatial_kernel_type = spatial_kernel_type or kernel_type
@@ -218,6 +225,7 @@ class FusionSVGP(ApproximateGP):
             inducing_points,
             variational_distribution,
             learn_inducing_locations=learn_inducing_locations,
+            jitter_val=self.variational_jitter,
         )
         
         # Initialize parent class
@@ -253,6 +261,7 @@ class FusionSVGP(ApproximateGP):
         self.likelihood = MultiSourceLikelihood(
             sources=self.sources,
             initial_noise=initial_noise,
+            noise_bounds=noise_bounds,
             learn_noise=learn_noise,
             learn_noise_sources=learn_noise_sources,
             learn_calibration=learn_calibration,
@@ -281,6 +290,14 @@ class FusionSVGP(ApproximateGP):
         mean_x = self.mean_module(x)
         covar_x = self.covar_module(x)
         return MultivariateNormal(mean_x, covar_x)
+
+    def __call__(self, *args, **kwargs):
+        """Evaluate the model with the configured Cholesky jitter."""
+        with gpytorch.settings.cholesky_jitter(
+            float_value=self.variational_jitter,
+            double_value=self.variational_jitter,
+        ):
+            return super().__call__(*args, **kwargs)
     
     def initialize_inducing_points(
         self,
@@ -411,6 +428,7 @@ class FusionSVGP(ApproximateGP):
                 inducing_points,
                 variational_distribution,
                 learn_inducing_locations=self.learn_inducing_locations,
+                jitter_val=self.variational_jitter,
             )
 
             # Replace the old variational strategy
@@ -574,7 +592,11 @@ class FusionSVGP(ApproximateGP):
             ELBO value (scalar).
         """
         # Get variational posterior at x
-        variational_dist = self.variational_strategy(x)
+        with gpytorch.settings.cholesky_jitter(
+            float_value=self.variational_jitter,
+            double_value=self.variational_jitter,
+        ):
+            variational_dist = self.variational_strategy(x)
 
         # Expected log likelihood
         expected_log_lik = self.likelihood.expected_log_prob(

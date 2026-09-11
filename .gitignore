@@ -1,6 +1,8 @@
 # Results and outputs
 /results
 results/
+/outputs
+outputs/
 
 # Python cache
 __pycache__/
@@ -10,22 +12,48 @@ __pycache__/
 
 # Jupyter
 .ipynb_checkpoints/
+Untitled.ipynb
 
 # IDEs
 .vscode/
 .idea/
+.claude/
 
 # Build artifacts
 *.egg-info/
 dist/
 build/
+*.pt
+*.pth
+*.bak
+*.aux.xml
 data/satellite_retreavals_75.csv
 data/FusionData_daily_merged.csv
 
 docs/
 
 .coverage
+.env
+*.html
+*_files/
 
 # Talk materials (presentation-specific)
 /talk.env
 METHODOLOGY.md
+
+# Scratch / derived data dumps (regenerated, not for version control)
+/corrupted_data/
+/data_for_analysis/
+/data_test/
+/experiment_data_used/
+/data/model_data/
+/data_for_notebook
+
+# Personal working notes (not for version control)
+/FOR_FUSIONGP.md
+/analysis.md
+/notes_probabilistic_fusion_epistemology.md
+/rq_discussion.md
+/METHODOLOGY.pdf
+/DataView.ipynb
+/notebooks/demo_backup.ipynb

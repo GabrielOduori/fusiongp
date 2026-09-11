@@ -5,6 +5,7 @@
 #
 # Reads map_data/*.csv from a run directory and saves PNGs to map_images/.
 
+import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -104,41 +105,75 @@ def make_dots(df, title, out_path, cmap="viridis", dot_size=8, alpha=0.85):
     print(f"Saved dots: {out_path}")
 
 
-run_dir = Path("outputs/demo_run_20260223_085327_n300 copy")   # <-- change this
-map_data = run_dir / "map_data"
-gpkf_dir = run_dir / "gpkf_maps"
-out_dir = run_dir / "map_images"
-out_dir.mkdir(exist_ok=True)
+def latest_run_dir():
+    run_dirs = sorted(Path("outputs").glob("demo_run_*"), key=lambda path: path.stat().st_mtime)
+    if not run_dirs:
+        raise FileNotFoundError("No outputs/demo_run_* directories found.")
+    return run_dirs[-1]
 
-# --- Static baseline maps (LUR, ATMO-Plan, FusionGP test-station predictions) ---
-for csv in sorted(map_data.glob("*.csv")):
-    df = pd.read_csv(csv).dropna(subset=["latitude", "longitude", "value"])
-    if df.empty:
-        print(f"Skipping {csv.name} — no valid rows")
-        continue
-    title = TITLES.get(csv.stem, csv.stem.replace("_", " ").title())
-    make_choropleth(df, title, out_dir / f"{csv.stem}.png")
 
-# --- GPKF sequential fusion: one map per day (mean NO2 + uncertainty) ---
-if gpkf_dir.exists():
-    gpkf_out = out_dir / "gpkf"
-    gpkf_out.mkdir(exist_ok=True)
-    gpkf_csvs = sorted(gpkf_dir.glob("gpkf_day_*.csv"))
-    print(f"\nProcessing {len(gpkf_csvs)} GPKF day maps …")
-    for csv in gpkf_csvs:
-        df = pd.read_csv(csv).dropna(subset=["latitude", "longitude", "mean_ug_m3"])
+def generate_maps(run_dir):
+    map_data = run_dir / "map_data"
+    gpkf_dir = run_dir / "gpkf_maps"
+    out_dir = run_dir / "map_images"
+    out_dir.mkdir(exist_ok=True)
+
+    # --- Static baseline maps (LUR, ATMO-Plan, FusionGP test-station predictions) ---
+    for csv in sorted(map_data.glob("*.csv")):
+        df = pd.read_csv(csv).dropna(subset=["latitude", "longitude", "value"])
         if df.empty:
+            print(f"Skipping {csv.name} — no valid rows")
             continue
-        day_num = int(csv.stem.split("_")[-1])
-        day_label = f"Day {day_num + 1}"
+        title = TITLES.get(csv.stem, csv.stem.replace("_", " ").title())
+        make_choropleth(df, title, out_dir / f"{csv.stem}.png")
 
-        # Mean NO2 map — clip to physical range
-        df["mean_ug_m3"] = df["mean_ug_m3"].clip(lower=0)
-        df_mean = df.rename(columns={"mean_ug_m3": "value"})
-        make_choropleth(df_mean, f"FusionGP (GPKF) – NO₂ {day_label} (µg/m³)",
-                        gpkf_out / f"{csv.stem}_mean.png")
+    # --- GPKF sequential fusion: one map per day (mean NO2 + uncertainty) ---
+    if gpkf_dir.exists():
+        gpkf_out = out_dir / "gpkf"
+        gpkf_out.mkdir(exist_ok=True)
+        gpkf_csvs = sorted(gpkf_dir.glob("gpkf_day_*.csv"))
+        print(f"\nProcessing {len(gpkf_csvs)} GPKF day maps …")
+        for csv in gpkf_csvs:
+            df = pd.read_csv(csv).dropna(subset=["latitude", "longitude", "mean_ug_m3"])
+            if df.empty:
+                continue
+            day_num = int(csv.stem.split("_")[-1])
+            day_label = f"Day {day_num + 1}"
 
-        # Uncertainty map
-        df_std = df.rename(columns={"std_ug_m3": "value"})
-        make_choropleth(df_std, f"FusionGP (GPKF) – Uncertainty {day_label} (µg/m³)",
-                        gpkf_out / f"{csv.stem}_std.png", cmap="plasma")
+            # Mean NO2 map — clip to physical range
+            df["mean_ug_m3"] = df["mean_ug_m3"].clip(lower=0)
+            df_mean = df.rename(columns={"mean_ug_m3": "value"})
+            make_choropleth(
+                df_mean,
+                f"FusionGP (GPKF) – NO₂ {day_label} (µg/m³)",
+                gpkf_out / f"{csv.stem}_mean.png",
+            )
+
+            # Uncertainty map
+            df_std = df.rename(columns={"std_ug_m3": "value"})
+            make_choropleth(
+                df_std,
+                f"FusionGP (GPKF) – Uncertainty {day_label} (µg/m³)",
+                gpkf_out / f"{csv.stem}_std.png",
+                cmap="plasma",
+            )
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Generate publication PNG maps for a demo run.")
+    parser.add_argument(
+        "run_dir",
+        nargs="?",
+        type=Path,
+        help="Run directory containing map_data/ and optional gpkf_maps/. Defaults to latest outputs/demo_run_*.",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+    generate_maps(args.run_dir or latest_run_dir())
+
+
+if __name__ == "__main__":
+    main()

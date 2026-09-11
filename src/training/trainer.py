@@ -303,8 +303,13 @@ class Trainer:
         """
         logger.info("Starting training...")
         
-        # Initialize inducing points from training data
-        train_dataset = FusionDataset(train_data)
+        # Initialize inducing points from training data.
+        # Column order MUST match the likelihood's source list: the likelihood
+        # indexes observation/mask columns by its own source order, so building
+        # the dataset with all loader sources (incl. disabled placeholders)
+        # silently maps sources to the wrong columns.
+        model_sources = getattr(self.model, "sources", None)
+        train_dataset = FusionDataset(train_data, sources=model_sources)
         train_x = train_dataset.get_input_tensor().to(self.device)
 
         # Use structured_grid for gridded data to enable Kronecker optimizations
@@ -321,7 +326,7 @@ class Trainer:
         
         # Prepare validation data
         if val_data is not None:
-            val_dataset = FusionDataset(val_data)
+            val_dataset = FusionDataset(val_data, sources=model_sources)
             val_x = val_dataset.get_input_tensor().to(self.device)
             val_y = val_dataset.observations.to(self.device)
             val_masks = val_dataset.source_masks.to(self.device)
@@ -363,6 +368,11 @@ class Trainer:
                 self.history.val_loss.append(val_loss)
             if val_epa_rmse is not None:
                 self.history.metrics.setdefault('val_epa_rmse', []).append(val_epa_rmse)
+            outputscale = getattr(self.model.covar_module, "outputscale", None)
+            if outputscale is not None:
+                self.history.metrics.setdefault('kernel_outputscale', []).append(
+                    outputscale.detach().item()
+                )
             self.history.learning_rates.append(
                 self.optimizer.param_groups[0]['lr']
             )
@@ -507,13 +517,18 @@ class Trainer:
         float
             Validation loss.
         """
-        self.model.eval()
-        self.model.likelihood.eval()
-        
+        # ELBO must be computed in train mode — GPyTorch eval mode switches
+        # variational_strategy to posterior predictive, making ELBO near-zero.
+        self.model.train()
+        self.model.likelihood.train()
+
         with torch.no_grad():
             elbo = self.model.elbo(val_x, val_y, val_masks)
             loss = -elbo / len(val_x)
-        
+
+        self.model.eval()
+        self.model.likelihood.eval()
+
         return loss.item()
 
     def _validate_epa_rmse(

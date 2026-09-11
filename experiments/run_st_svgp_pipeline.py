@@ -26,7 +26,7 @@ from src.visualization import plot_predictions
 try:
     import folium
     from branca.colormap import linear as _linear_colormap
-except Exception:
+except ImportError:
     folium = None
     _linear_colormap = None
 from src.evaluation import rmse, mae, bias, mse

@@ -63,15 +63,15 @@ class Callback(ABC):
         bool
             True to continue training, False to stop.
         """
-        pass
+        raise NotImplementedError
     
     def on_train_begin(self, model: Any) -> None:
         """Called at the start of training."""
-        pass
+        return None
     
     def on_train_end(self, model: Any, logs: Dict[str, float]) -> None:
         """Called at the end of training."""
-        pass
+        return None
 
 
 class EarlyStopping(Callback):
