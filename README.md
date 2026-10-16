@@ -181,6 +181,14 @@ pip install torch gpytorch pandas numpy scipy scikit-learn matplotlib seaborn tq
 
 ## Data Setup
 
+Dataset DOI: [10.5281/zenodo.23413201](https://doi.org/10.5281/zenodo.23413201).
+Related paper: [10.1016/j.acags.2026.100416](https://doi.org/10.1016/j.acags.2026.100416).
+
+Download the published Zenodo dataset's input CSV files and extract them into
+`data/` or a separate local folder. For the prepared
+`fusiongp-input-data.zip` archive, the CSV files are inside the extracted `data/`
+subfolder; pass that subfolder to `--data-dir`.
+
 Place your data files in the `data/` folder at the repository root:
 
 ```
