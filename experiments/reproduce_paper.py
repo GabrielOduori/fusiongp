@@ -1,25 +1,34 @@
 """
 Reproduce FusionGP paper results.
 
-Multi-source NO2 fusion with evaluation against EPA ground truth.
+Multi-source NO2 fusion (EPA + satellite + LUR/ATMO-Plan prior) with SVGP
+training, GP-Kalman Filter (GPKF) sequential fusion, and Kalman-smoothed
+day-by-day maps, evaluated against held-out EPA ground truth.
 
-Methodology:
-- When USE_EPA_IN_TRAINING=False: Train on Satellite (and prior), evaluate on held-out EPA
-- When USE_EPA_IN_TRAINING=True: Legacy mode with all sources (has data leakage)
-
-Pre-calibration uses colocated EPA-LCS observations to learn a linear correction
-before training, avoiding data leakage while bringing sources to EPA scale.
+This is the canonical entry point — it runs the same pipeline implementation
+as experiments/run_demo_pipeline.py (kept only as a backward-compatible
+alias for existing subprocess callers); both call
+experiments/paper_pipeline/full_pipeline.py.
 
 Usage:
-    python reproduce_paper.py
+    # Standard run (M=300, 200 epochs):
+    python experiments/reproduce_paper.py
 
-Outputs saved to results/experiment_YYYYMMDD_HHMMSS/ with subdirectories:
-    figures/ - Training curves, predictions, uncertainty maps
-    models/  - Trained model checkpoint
-    tables/  - Metrics CSVs and experiment summary
+    # Run pipeline then M-sweep for RQ2:
+    python experiments/reproduce_paper.py --sweep
 
-Implementation lives in experiments/paper_pipeline/ (config, data, evaluation,
-plotting, reporting, inference, pipeline) — this file is just the entry point.
+    # Custom M and epochs:
+    python experiments/reproduce_paper.py --n-inducing 400 --epochs 150
+
+    # Leave-one-station-out cross-validation (see reproduce_paper_results.py
+    # and run_loso_and_sweep_overnight.sh for the full 9-station sweep):
+    EPA_HOLDOUT_MODE=station EPA_HOLDOUT_GRID_IDS=<grid_id> \\
+        PRIOR_MEAN_SOURCE=atmo python experiments/reproduce_paper.py
+
+Outputs saved to outputs/demo_run_<tag>/, including per-day gpkf_maps/ and
+kalman_maps/, baseline comparison tables, and a final_results_report.md.
+See experiments/paper_pipeline/full_pipeline.py's module docstring and
+--help for the full env-var and CLI surface.
 """
 
 import sys
@@ -29,7 +38,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent.parent))
 sys.path.insert(0, str(Path(__file__).parent))
 
-from paper_pipeline import pipeline
+from paper_pipeline import full_pipeline
 
 if __name__ == "__main__":
-    pipeline.run()
+    full_pipeline.main()
